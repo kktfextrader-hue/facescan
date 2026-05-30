@@ -1,0 +1,1382 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+<title>AXIOM-7 · Biometric Terminal</title>
+<script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/face-api.js@0.22.2/dist/face-api.min.js"></script>
+<link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&family=Rajdhani:wght@400;500;700&family=Share+Tech+Mono&display=swap" rel="stylesheet"/>
+<style>
+*{box-sizing:border-box;margin:0;padding:0;}
+html,body,#root{width:100%;height:100%;overflow:hidden;background:#000;}
+::-webkit-scrollbar{width:3px;}
+::-webkit-scrollbar-thumb{background:rgba(0,150,220,.2);}
+@keyframes sweep{0%{top:-2px;opacity:.6}100%{top:105%;opacity:0}}
+@keyframes blink{0%,100%{opacity:1}50%{opacity:.1}}
+@keyframes spin{from{transform:rotate(0)}to{transform:rotate(360deg)}}
+@keyframes pulse{0%,100%{opacity:.4}50%{opacity:1}}
+@keyframes cardIn{from{opacity:0;transform:scale(.92)}to{opacity:1;transform:scale(1)}}
+@keyframes logIn{from{opacity:0;transform:translateX(-8px)}to{opacity:1;transform:translateX(0)}}
+@keyframes flashAnim{0%{opacity:.55}100%{opacity:0}}
+@keyframes modalIn{from{opacity:0;transform:translate(-50%,-50%) scale(.93)}to{opacity:1;transform:translate(-50%,-50%) scale(1)}}
+@keyframes idIn{from{opacity:0;transform:translateY(16px)}to{opacity:1;transform:translateY(0)}}
+@keyframes matchGlow{0%,100%{box-shadow:0 0 8px rgba(0,255,136,.2)}50%{box-shadow:0 0 24px rgba(0,255,136,.6)}}
+@keyframes freezeBar{from{transform:scaleX(1)}to{transform:scaleX(0)}}
+@keyframes nearGlow{0%,100%{box-shadow:0 0 6px rgba(255,170,0,.15)}50%{box-shadow:0 0 18px rgba(255,170,0,.4)}}
+.blink{animation:blink 2.2s ease-in-out infinite}
+.pulse{animation:pulse 2.4s ease-in-out infinite}
+.spin{animation:spin 9s linear infinite}
+.cardIn{animation:cardIn .28s ease-out}
+.logIn{animation:logIn .18s ease-out}
+.flash{animation:flashAnim .22s ease-out forwards}
+</style>
+</head>
+<body><div id="root"></div>
+<script type="text/babel" data-presets="react">
+const {useState,useEffect,useRef,useCallback} = React;
+
+/* ── CONSTANTS ── */
+const MODEL_URL    = "https://cdn.jsdelivr.net/gh/justadudewhohacks/face-api.js@0.22.2/weights";
+const Q_THRESH     = 56, BLUR_MIN=11, COOLDOWN=3000, STAB_MIN=53;
+const FRONT_MAX=14, SIDE_MIN=17, SIDE_MAX=55;
+const CONF_MAXD=0.60, CONF_RNG=0.40, MATCH_CONF=90;
+const FREEZE_THRESH=70, FREEZE_HOLD=30000;
+const VER = "4.3";
+
+/* ── UTILS ── */
+const uid    = ()=>Math.random().toString(36).slice(2,9).toUpperCase();
+const clamp  = (v,a,b)=>Math.max(a,Math.min(b,v));
+const avgPts = pts=>({x:pts.reduce((s,p)=>s+p.x,0)/pts.length,y:pts.reduce((s,p)=>s+p.y,0)/pts.length});
+const qCol   = q=>q>=Q_THRESH?"#00ff88":q>=36?"#ffaa00":"#ff4455";
+const d2conf = d=>Math.round(Math.min(100,Math.max(0,(CONF_MAXD-d)/CONF_RNG*100)));
+
+function estPose(lm){
+  const p=lm.positions,le=avgPts(p.slice(36,42)),re=avgPts(p.slice(42,48));
+  const ns=p[30],ml=p[48],mr=p[54];
+  const ew=re.x-le.x,emx=(le.x+re.x)/2,emy=(le.y+re.y)/2;
+  const yaw=ew>1?Math.round(clamp(((ns.x-emx)/(ew*.5))*45,-90,90)):0;
+  const roll=Math.round(Math.atan2(re.y-le.y,re.x-le.x)*180/Math.PI);
+  const mmy=(ml.y+mr.y)/2,fh=mmy-emy;
+  const pitch=fh>5?Math.round(((ns.y-emy)/fh-.44)*65):0;
+  return{yaw,pitch,roll};
+}
+function posecat(yaw){
+  if(Math.abs(yaw)<=FRONT_MAX)return"FRONTAL";
+  if(yaw<-SIDE_MIN)return"LEFT";
+  if(yaw>SIDE_MIN)return"RIGHT";
+  return"TRANSITION";
+}
+function calcBlur(ctx,x,y,w,h){
+  const sw=Math.min(64,Math.floor(w)),sh=Math.min(64,Math.floor(h));
+  if(sw<4||sh<4)return 25;
+  const d=ctx.getImageData(Math.floor(x),Math.floor(y),sw,sh).data;
+  let s=0,n=0;
+  for(let r=1;r<sh-1;r+=2)for(let c=1;c<sw-1;c+=2){
+    const i=(r*sw+c)*4,g=d[i]*.299+d[i+1]*.587+d[i+2]*.114;
+    const t=((r-1)*sw+c)*4,b2=((r+1)*sw+c)*4,l=(r*sw+c-1)*4,ri=(r*sw+c+1)*4;
+    s+=Math.abs(4*g-(d[t]*.299+d[t+1]*.587+d[t+2]*.114)-(d[b2]*.299+d[b2+1]*.587+d[b2+2]*.114)
+                  -(d[l]*.299+d[l+1]*.587+d[l+2]*.114)-(d[ri]*.299+d[ri+1]*.587+d[ri+2]*.114));
+    n++;
+  }
+  return clamp(Math.round((s/n)*3.5),0,100);
+}
+function calcBrt(ctx,x,y,w,h){
+  const sw=Math.min(48,Math.floor(w)),sh=Math.min(48,Math.floor(h));
+  if(sw<2||sh<2)return 128;
+  const d=ctx.getImageData(Math.floor(x),Math.floor(y),sw,sh).data;
+  let s=0;for(let i=0;i<d.length;i+=4)s+=d[i]*.299+d[i+1]*.587+d[i+2]*.114;
+  return Math.round(s/(d.length/4));
+}
+/* สร้าง thumb 2 ขนาด: display (96px) และ tiny สำหรับ sheet (28px, ~800B) */
+function makeThumb(src,sx,sy,sw,sh2){
+  // display thumb
+  const dc=document.createElement("canvas");dc.width=96;dc.height=96;
+  try{dc.getContext("2d").drawImage(src,Math.floor(sx),Math.floor(sy),Math.max(1,Math.floor(sw)),Math.max(1,Math.floor(sh2)),0,0,96,96);}catch(_){}
+  // tiny thumb สำหรับ sheet
+  const tc=document.createElement("canvas");tc.width=28;tc.height=28;
+  try{tc.getContext("2d").drawImage(src,Math.floor(sx),Math.floor(sy),Math.max(1,Math.floor(sw)),Math.max(1,Math.floor(sh2)),0,0,28,28);}catch(_){}
+  return{thumb:dc.toDataURL("image/jpeg",.8),tinyThumb:tc.toDataURL("image/jpeg",.25)};
+}
+function ddist(a,b){
+  if(!a||!b)return 1;
+  let s=0;for(let i=0;i<a.length;i++)s+=(a[i]-b[i])**2;
+  return Math.sqrt(s);
+}
+function vRect(v,cw,ch){
+  if(!v||!v.videoWidth)return{x:0,y:0,w:cw,h:ch,sx:1,sy:1};
+  const va=v.videoWidth/v.videoHeight,ca=cw/ch;
+  let w,h,x,y;
+  if(va>ca){w=cw;h=cw/va;x=0;y=(ch-h)/2;}else{h=ch;w=ch*va;x=(cw-w)/2;y=0;}
+  return{x,y,w,h,sx:w/v.videoWidth,sy:h/v.videoHeight};
+}
+function recognize(desc,db){
+  if(!db.length)return null;
+  let best=null,bd=Infinity;
+  for(const p of db){
+    const ps=Object.values(p.poses).filter(Boolean);
+    if(!ps.length)continue;
+    const md=Math.min(...ps.map(x=>ddist(x.desc,desc)));
+    if(md<bd){bd=md;best=p;}
+  }
+  if(bd>=CONF_MAXD)return null;
+  const conf=d2conf(bd);
+  if(conf<=0)return null;
+  return{...best,conf,dist:Math.round(bd*1000)/1000,matched:conf>=MATCH_CONF,phone:best.phone||""};
+}
+
+/* ── CORNER ── */
+function C({p,s=16,c="rgba(0,150,220,.38)"}){
+  const st={position:"absolute",width:s,height:s,borderStyle:"solid",borderColor:c,borderWidth:0};
+  if(p==="tl")Object.assign(st,{top:4,left:4,borderTopWidth:1.5,borderLeftWidth:1.5});
+  if(p==="tr")Object.assign(st,{top:4,right:4,borderTopWidth:1.5,borderRightWidth:1.5});
+  if(p==="bl")Object.assign(st,{bottom:4,left:4,borderBottomWidth:1.5,borderLeftWidth:1.5});
+  if(p==="br")Object.assign(st,{bottom:4,right:4,borderBottomWidth:1.5,borderRightWidth:1.5});
+  return <div style={st}/>;
+}
+
+/* ── METRIC ROW ── */
+function MRow({row}){
+  const LB={fontFamily:"Rajdhani,sans-serif",fontWeight:500,fontSize:8,color:"rgba(120,185,225,.48)",textTransform:"uppercase",letterSpacing:".09em"};
+  const MN={fontFamily:"'Share Tech Mono',monospace"};
+  if(row.sec)return<div style={{padding:"4px 0 1px",flexShrink:0}}><span style={{...LB,fontSize:7,color:"rgba(0,150,220,.22)",letterSpacing:".18em"}}>── {row.sec}</span></div>;
+  if(row.bar){const c=qCol(row.val);return(
+    <div style={{padding:"2px 0",borderBottom:"1px solid rgba(0,150,220,.05)",flexShrink:0}}>
+      <div style={{display:"flex",justifyContent:"space-between",marginBottom:2}}>
+        <span style={LB}>{row.lbl}</span><span style={{...MN,fontSize:9,color:c}}>{row.val}</span>
+      </div>
+      <div style={{height:2,background:"rgba(0,150,220,.09)",borderRadius:1,overflow:"hidden"}}>
+        <div style={{width:`${clamp(row.val,0,100)}%`,height:"100%",background:c,borderRadius:1,transition:"width .35s"}}/>
+      </div>
+    </div>);}
+  return(<div style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"1.5px 0",borderBottom:"1px solid rgba(0,150,220,.05)",flexShrink:0}}>
+    <span style={LB}>{row.lbl}</span>
+    <span style={{...MN,fontSize:row.big?11:10,color:row.col||"#00c8ff",fontWeight:row.big?700:400,transition:"color .3s"}}>{row.val}</span>
+  </div>);
+}
+
+/* ── MEMORY CARD ── */
+function MemCard({pose:pp,card}){
+  const [k,setK]=useState(0);
+  useEffect(()=>{if(card)setK(x=>x+1);},[card?.id]);
+  const MN={fontFamily:"'Share Tech Mono',monospace"},OR={fontFamily:"Orbitron,monospace",fontWeight:700};
+  if(!card)return(<div style={{height:62,border:"1px solid rgba(0,150,220,.07)",borderRadius:3,
+    display:"flex",alignItems:"center",justifyContent:"center",gap:8,
+    background:"rgba(0,5,14,.55)",padding:6,position:"relative",flexShrink:0}}>
+    <C p="tl" s={7} c="rgba(0,150,220,.1)"/><C p="br" s={7} c="rgba(0,150,220,.1)"/>
+    <svg viewBox="0 0 40 40" width="22" height="22" style={{opacity:.1}}>
+      <circle cx="20" cy="14" r="8" fill="none" stroke="#00c8ff" strokeWidth="1.2"/>
+      <path d="M2 40 Q2 28 20 28 Q38 28 38 40" fill="none" stroke="#00c8ff" strokeWidth="1.2"/>
+    </svg>
+    <div>
+      <div style={{...OR,fontSize:7,color:"rgba(0,150,220,.2)",letterSpacing:".1em"}}>{pp}</div>
+      <div className="blink" style={{...MN,fontSize:6.5,color:"rgba(0,150,220,.16)"}}>WAITING...</div>
+    </div>
+  </div>);
+  const qc=qCol(card.qual);
+  return(<div key={k} className="cardIn" style={{height:62,border:`1px solid ${qc}28`,borderRadius:3,
+    padding:"4px 7px",background:`linear-gradient(135deg,${qc}07 0%,rgba(0,8,20,.95) 60%)`,
+    position:"relative",overflow:"hidden",flexShrink:0}}>
+    <C p="tl" s={7} c={`${qc}38`}/><C p="br" s={7} c={`${qc}25`}/>
+    <div style={{display:"flex",gap:6,height:"100%"}}>
+      <div style={{width:40,height:"100%",borderRadius:2,overflow:"hidden",border:`1px solid ${qc}35`,flexShrink:0}}>
+        <img src={card.thumb} alt="" style={{width:"100%",height:"100%",objectFit:"cover",transform:"scaleX(-1)"}}/>
+      </div>
+      <div style={{flex:1,display:"flex",flexDirection:"column",justifyContent:"space-between",minWidth:0}}>
+        <span style={{...OR,fontSize:6.5,color:qc,letterSpacing:".1em"}}>{pp}</span>
+        <div style={{...MN,fontSize:7,lineHeight:1.6}}>
+          <span style={{color:"rgba(130,190,225,.28)"}}>Q:</span><span style={{color:qc}}>{card.qual} </span>
+          <span style={{color:"rgba(130,190,225,.28)"}}>YAW:</span><span style={{color:"#00c8ff"}}>{card.yaw}° </span>
+          <span style={{color:"rgba(130,190,225,.28)"}}>STB:</span><span style={{color:card.stab>70?"#00ff88":"#ffaa00"}}>{card.stab}%</span>
+        </div>
+        <span style={{...MN,fontSize:6,color:"rgba(0,150,220,.28)"}}>{card.ts.toLocaleTimeString("en-US",{hour12:false})}</span>
+      </div>
+    </div>
+    <div style={{position:"absolute",top:3,right:5,...MN,fontSize:6,color:"#00ff88"}}>● OK</div>
+    <div style={{position:"absolute",bottom:0,left:0,right:0,height:1,background:`linear-gradient(90deg,transparent,${qc}45,transparent)`}}/>
+  </div>);
+}
+
+/* ── DB CARD ── */
+function DBCard({person,onDelete,onEdit,highlight}){
+  const MN={fontFamily:"'Share Tech Mono',monospace"},OR={fontFamily:"Orbitron,monospace",fontWeight:700};
+  const RJ={fontFamily:"Rajdhani,sans-serif",fontWeight:500};
+  const [editing,setEditing]=useState(false);
+  const [eName,setEName]=useState(person.name||"");
+  const [ePhone,setEPhone]=useState(person.phone||"");
+  const poses=Object.values(person.poses).filter(Boolean).length;
+
+  function startEdit(){setEName(person.name||"");setEPhone(person.phone||"");setEditing(true);}
+  function cancelEdit(){setEditing(false);}
+  function confirmEdit(){
+    if(!eName.trim())return;
+    onEdit(person.id,eName.trim(),ePhone.trim());
+    setEditing(false);
+  }
+
+  const borderCol=highlight?.matched?"rgba(0,255,136,.3)":highlight?"rgba(255,170,0,.2)":"rgba(0,150,220,.13)";
+  const bg=highlight?.matched?"rgba(0,255,136,.05)":highlight?"rgba(255,170,0,.05)":"rgba(0,6,16,.85)";
+
+  if(editing)return(
+    <div className="cardIn" style={{border:"1px solid rgba(0,200,255,.35)",borderRadius:3,padding:"7px 8px",
+      background:"rgba(0,10,28,.97)",position:"relative",flexShrink:0}}>
+      <C p="tl" s={7} c="rgba(0,200,255,.3)"/>
+      <div style={{...OR,fontSize:7,color:"rgba(0,200,255,.55)",letterSpacing:".15em",marginBottom:6}}>EDIT IDENTITY</div>
+      <div style={{marginBottom:5}}>
+        <div style={{...MN,fontSize:7,color:"rgba(0,150,220,.45)",marginBottom:2}}>NAME / PATIENT ID</div>
+        <input autoFocus value={eName} onChange={e=>setEName(e.target.value)}
+          onKeyDown={e=>{if(e.key==="Enter")confirmEdit();if(e.key==="Escape")cancelEdit();}}
+          style={{width:"100%",background:"rgba(0,15,35,.85)",border:"1px solid rgba(0,150,220,.35)",
+            borderRadius:2,color:"#00e5ff",fontFamily:"'Share Tech Mono'",fontSize:10,padding:"5px 8px",outline:"none"}}/>
+      </div>
+      <div style={{marginBottom:7}}>
+        <div style={{...MN,fontSize:7,color:"rgba(0,150,220,.45)",marginBottom:2}}>PHONE / CONTACT</div>
+        <input value={ePhone} onChange={e=>setEPhone(e.target.value)}
+          onKeyDown={e=>{if(e.key==="Enter")confirmEdit();if(e.key==="Escape")cancelEdit();}}
+          placeholder="e.g. 081-234-5678"
+          style={{width:"100%",background:"rgba(0,15,35,.85)",border:"1px solid rgba(0,150,220,.35)",
+            borderRadius:2,color:"#00e5ff",fontFamily:"'Share Tech Mono'",fontSize:10,padding:"5px 8px",outline:"none"}}/>
+      </div>
+      <div style={{display:"flex",gap:5}}>
+        <button onClick={cancelEdit} style={{flex:1,background:"rgba(255,255,255,.04)",border:"1px solid rgba(255,255,255,.1)",
+          borderRadius:2,color:"rgba(255,255,255,.35)",cursor:"pointer",fontFamily:"Orbitron",fontSize:7,padding:"5px",letterSpacing:".1em"}}>✕ CANCEL</button>
+        <button onClick={confirmEdit} disabled={!eName.trim()} style={{flex:2,
+          background:eName.trim()?"rgba(0,255,136,.12)":"rgba(0,255,136,.03)",
+          border:`1px solid ${eName.trim()?"rgba(0,255,136,.42)":"rgba(0,255,136,.1)"}`,
+          borderRadius:2,color:eName.trim()?"#00ff88":"rgba(0,255,136,.22)",
+          cursor:eName.trim()?"pointer":"default",fontFamily:"Orbitron",fontWeight:700,
+          fontSize:7,padding:"5px",letterSpacing:".1em",transition:"all .2s"}}>✓ SAVE</button>
+      </div>
+    </div>
+  );
+
+  return(<div className="cardIn" style={{border:`1px solid ${borderCol}`,
+    borderRadius:3,padding:"6px 8px",background:bg,
+    position:"relative",overflow:"hidden",flexShrink:0,transition:"all .3s"}}>
+    <C p="tl" s={7} c={highlight?.matched?"rgba(0,255,136,.28)":"rgba(0,150,220,.18)"}/>
+    <div style={{display:"flex",gap:8,alignItems:"center"}}>
+      <div style={{width:44,height:44,borderRadius:2,overflow:"hidden",
+        border:`1px solid ${highlight?.matched?"rgba(0,255,136,.38)":"rgba(0,150,220,.25)"}`,flexShrink:0}}>
+        <img src={person.thumb||""} alt="" style={{width:"100%",height:"100%",objectFit:"cover",transform:"scaleX(-1)"}}/>
+      </div>
+      <div style={{flex:1,minWidth:0}}>
+        <div style={{...OR,fontSize:9,color:highlight?.matched?"#00ff88":"#00c8ff",letterSpacing:".08em",
+          whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}}>{person.name}</div>
+        {person.phone&&<div style={{...MN,fontSize:7.5,color:"rgba(0,220,255,.55)",marginTop:1,letterSpacing:".04em"}}>
+          ☎ {person.phone}
+        </div>}
+        <div style={{...MN,fontSize:7,color:"rgba(0,150,220,.42)",marginTop:1}}>
+          {poses}/3 poses · {new Date(person.enrolledAt||Date.now()).toLocaleTimeString("en-US",{hour12:false})}
+        </div>
+        {highlight&&<div style={{...MN,fontSize:8,color:highlight.matched?"#00ff88":"#ffaa00",marginTop:1}}>
+          {highlight.matched?"✓":"~"} {highlight.conf}%
+        </div>}
+        <div style={{display:"flex",gap:5,marginTop:2}}>
+          {["F","L","R"].map((k2,i)=><span key={k2} style={{...MN,fontSize:6.5,color:Object.values(person.poses)[i]?"#00ff88":"rgba(255,255,255,.12)"}}>
+            {Object.values(person.poses)[i]?"●":"○"}{k2}
+          </span>)}
+        </div>
+      </div>
+      <div style={{display:"flex",flexDirection:"column",gap:3,flexShrink:0}}>
+        <button onClick={startEdit} style={{
+          background:"rgba(0,150,220,.07)",border:"1px solid rgba(0,150,220,.22)",borderRadius:2,
+          color:"rgba(0,200,255,.55)",cursor:"pointer",fontFamily:"'Share Tech Mono'",fontSize:7,
+          padding:"3px 7px",transition:"all .2s"}}
+          onMouseEnter={e=>e.currentTarget.style.background="rgba(0,150,220,.2)"}
+          onMouseLeave={e=>e.currentTarget.style.background="rgba(0,150,220,.07)"}>EDIT</button>
+        <button onClick={()=>onDelete(person.id)} style={{
+          background:"rgba(255,50,50,.07)",border:"1px solid rgba(255,50,50,.18)",borderRadius:2,
+          color:"rgba(255,80,80,.5)",cursor:"pointer",fontFamily:"'Share Tech Mono'",fontSize:7,
+          padding:"3px 7px",transition:"all .2s"}}
+          onMouseEnter={e=>e.currentTarget.style.background="rgba(255,50,50,.18)"}
+          onMouseLeave={e=>e.currentTarget.style.background="rgba(255,50,50,.07)"}>DEL</button>
+      </div>
+    </div>
+    <div style={{position:"absolute",bottom:0,left:0,right:0,height:1,
+      background:`linear-gradient(90deg,transparent,${highlight?.matched?"rgba(0,255,136,.2)":"rgba(0,150,220,.14)"},transparent)`}}/>
+  </div>);
+}
+
+/* ── UPDATE PANEL ── */
+function UpdatePanel({target,proposed}){
+  const MN={fontFamily:"'Share Tech Mono',monospace"},OR={fontFamily:"Orbitron,monospace",fontWeight:700};
+  const RJ={fontFamily:"Rajdhani,sans-serif",fontWeight:500};
+  if(!target)return(<div style={{flex:1,display:"flex",flexDirection:"column",alignItems:"center",
+    justifyContent:"center",gap:8,border:"1px solid rgba(255,170,0,.07)",borderRadius:3,background:"rgba(0,5,14,.4)"}}>
+    <svg width="40" height="40" viewBox="0 0 40 40" className="spin" style={{opacity:.3}}>
+      <circle cx="20" cy="20" r="16" fill="none" stroke="#ffaa00" strokeWidth=".8" strokeDasharray="8 4"/>
+    </svg>
+    <span style={{...MN,fontSize:7.5,color:"rgba(255,170,0,.3)",textAlign:"center",lineHeight:1.7}}>
+      AIM AT ENROLLED<br/>SUBJECT TO UPDATE
+    </span>
+  </div>);
+  return(<div style={{flex:1,display:"flex",flexDirection:"column",gap:4,overflow:"hidden",minHeight:0}}>
+    <div style={{display:"flex",gap:8,alignItems:"center",padding:"4px 7px",
+      background:"rgba(255,170,0,.07)",border:"1px solid rgba(255,170,0,.15)",borderRadius:3,flexShrink:0}}>
+      <img src={target.thumb||""} style={{width:32,height:32,borderRadius:2,border:"1px solid rgba(255,170,0,.3)",flexShrink:0,transform:"scaleX(-1)",objectFit:"cover"}}/>
+      <div style={{flex:1,minWidth:0}}>
+        <div style={{...OR,fontSize:8,color:"#ffaa00",letterSpacing:".08em",whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}}>{target.name}</div>
+        <div style={{...MN,fontSize:7,color:"rgba(255,170,0,.5)"}}>UPDATING · {target.conf}%</div>
+      </div>
+    </div>
+    {["FRONTAL","LEFT","RIGHT"].map(pose=>{
+      const stored=target.poses[pose],prop=proposed[pose];
+      const tc=prop?.type==="NEW"?"#00ff88":"#ffaa00";
+      return(<div key={pose} style={{border:`1px solid ${prop?"rgba(255,170,0,.2)":"rgba(0,150,220,.08)"}`,borderRadius:3,
+        padding:"5px 7px",background:prop?"rgba(20,14,0,.7)":"rgba(0,5,14,.5)",flexShrink:0,transition:"all .3s"}}>
+        <div style={{display:"flex",justifyContent:"space-between",marginBottom:4}}>
+          <span style={{...RJ,fontSize:8,color:"rgba(120,185,225,.45)",textTransform:"uppercase"}}>{pose}</span>
+          {prop&&<span style={{...MN,fontSize:7,color:tc}}>{prop.type}</span>}
+        </div>
+        <div style={{display:"flex",gap:6,alignItems:"center"}}>
+          <div style={{flex:1,display:"flex",gap:4,alignItems:"center"}}>
+            {stored?(<><img src={stored.thumb||""} style={{width:28,height:28,borderRadius:2,border:"1px solid rgba(0,150,220,.25)",transform:"scaleX(-1)",objectFit:"cover"}}/>
+              <span style={{...MN,fontSize:7,color:"rgba(0,150,220,.6)"}}>Q:{stored.qual}</span>
+            </>):<span style={{...MN,fontSize:7,color:"rgba(255,255,255,.12)"}}>NONE</span>}
+          </div>
+          {prop&&<span style={{...MN,fontSize:10,color:tc,flexShrink:0}}>→</span>}
+          {prop&&<div style={{flex:1,display:"flex",gap:4,alignItems:"center",justifyContent:"flex-end"}}>
+            <span style={{...MN,fontSize:7,color:tc}}>Q:{prop.qual}</span>
+            <img src={prop.thumb||""} style={{width:28,height:28,borderRadius:2,border:`1px solid ${tc}50`,transform:"scaleX(-1)",objectFit:"cover"}}/>
+          </div>}
+          {!prop&&<span style={{...MN,fontSize:6.5,color:"rgba(0,150,220,.2)",marginLeft:"auto"}}>{stored?"SCANNING...":"WAITING..."}</span>}
+        </div>
+      </div>);
+    })}
+    <div style={{fontFamily:"'Share Tech Mono'",fontSize:7,color:"rgba(255,170,0,.4)",textAlign:"center",flexShrink:0,padding:"3px 0"}}>
+      {Object.values(proposed).filter(Boolean).length} CHANGE{Object.values(proposed).filter(Boolean).length===1?"":"S"} QUEUED
+    </div>
+  </div>);
+}
+
+/* ── SAVE MODAL ── */
+function SaveModal({mem:mc,onSave,onCancel}){
+  const[name,setName]=useState("");
+  const[phone,setPhone]=useState("");
+  const OR={fontFamily:"Orbitron,monospace",fontWeight:700},MN={fontFamily:"'Share Tech Mono',monospace"};
+  return(<div style={{position:"fixed",inset:0,background:"rgba(0,0,0,.72)",zIndex:9998,backdropFilter:"blur(4px)"}}>
+    <div style={{position:"absolute",top:"50%",left:"50%",transform:"translate(-50%,-50%)",animation:"modalIn .22s ease-out",
+      background:"rgba(0,8,22,.97)",border:"1px solid rgba(0,150,220,.35)",borderRadius:6,padding:"22px 24px",width:320}}>
+      <C p="tl" s={12} c="rgba(0,150,220,.45)"/><C p="tr" s={12} c="rgba(0,150,220,.45)"/>
+      <C p="bl" s={12} c="rgba(0,150,220,.2)"/><C p="br" s={12} c="rgba(0,150,220,.2)"/>
+      <div style={{...OR,fontSize:9,color:"#00c8ff",letterSpacing:".22em",marginBottom:4,textAlign:"center"}}>SAVE IDENTITY</div>
+      <div style={{height:1,background:"linear-gradient(90deg,transparent,rgba(0,150,220,.4),transparent)",marginBottom:14}}/>
+      <div style={{display:"flex",gap:10,justifyContent:"center",marginBottom:14}}>
+        {["FRONTAL","LEFT","RIGHT"].map(pp=>(<div key={pp} style={{textAlign:"center"}}>
+          <div style={{fontFamily:"'Share Tech Mono'",fontSize:8,color:mc[pp]?"#00ff88":"rgba(255,255,255,.18)",marginBottom:2}}>{mc[pp]?"●":"○"}</div>
+          <div style={{fontFamily:"'Share Tech Mono'",fontSize:6,color:"rgba(0,150,220,.4)"}}>{pp[0]}</div>
+        </div>))}
+      </div>
+      <div style={{...MN,fontSize:8,color:"rgba(0,150,220,.5)",letterSpacing:".1em",marginBottom:7}}>NAME / PATIENT ID</div>
+      <input autoFocus value={name} onChange={e=>setName(e.target.value)}
+        onKeyDown={e=>e.key==="Enter"&&name.trim()&&onSave(name.trim(),phone.trim())}
+        placeholder="e.g. John Doe / HN-0042"
+        style={{width:"100%",background:"rgba(0,15,35,.8)",border:"1px solid rgba(0,150,220,.3)",
+          borderRadius:3,color:"#00e5ff",fontFamily:"'Share Tech Mono'",fontSize:11,padding:"9px 12px",outline:"none"}}/>
+      <div style={{...MN,fontSize:8,color:"rgba(0,150,220,.45)",letterSpacing:".1em",marginBottom:7,marginTop:12}}>PHONE / CONTACT <span style={{color:"rgba(0,150,220,.25)"}}>(optional)</span></div>
+      <input value={phone} onChange={e=>setPhone(e.target.value)}
+        onKeyDown={e=>e.key==="Enter"&&name.trim()&&onSave(name.trim(),phone.trim())}
+        placeholder="e.g. 081-234-5678"
+        style={{width:"100%",background:"rgba(0,15,35,.8)",border:"1px solid rgba(0,150,220,.3)",
+          borderRadius:3,color:"#00e5ff",fontFamily:"'Share Tech Mono'",fontSize:11,padding:"9px 12px",outline:"none"}}/>
+      <div style={{...MN,fontSize:7,color:"rgba(0,150,220,.28)",marginTop:5,marginBottom:16}}>Press ENTER to confirm</div>
+      <div style={{display:"flex",gap:10}}>
+        <button onClick={onCancel} style={{flex:1,background:"rgba(255,255,255,.04)",border:"1px solid rgba(255,255,255,.1)",borderRadius:3,color:"rgba(255,255,255,.35)",cursor:"pointer",fontFamily:"Orbitron",fontSize:8,padding:"9px",letterSpacing:".14em"}}>CANCEL</button>
+        <button onClick={()=>name.trim()&&onSave(name.trim(),phone.trim())} disabled={!name.trim()} style={{flex:2,
+          background:name.trim()?"rgba(0,255,136,.1)":"rgba(0,255,136,.03)",
+          border:`1px solid ${name.trim()?"rgba(0,255,136,.42)":"rgba(0,255,136,.1)"}`,
+          borderRadius:3,color:name.trim()?"#00ff88":"rgba(0,255,136,.22)",cursor:name.trim()?"pointer":"default",
+          fontFamily:"Orbitron",fontWeight:700,fontSize:8,padding:"9px",letterSpacing:".14em",transition:"all .2s"}}>
+          CONFIRM &amp; SAVE
+        </button>
+      </div>
+    </div>
+  </div>);
+}
+
+/* ── SETTINGS MODAL ── */
+function SettingsModal({url,onSave,onClose}){
+  const[input,setInput]=useState(url||"");
+  const[testing,setTesting]=useState(false);
+  const[result,setResult]=useState(null);
+  const[copied,setCopied]=useState(false);
+  const OR={fontFamily:"Orbitron,monospace",fontWeight:700},MN={fontFamily:"'Share Tech Mono',monospace"};
+  const RJ={fontFamily:"Rajdhani,sans-serif",fontWeight:500};
+  const GAS=`const SHEET_NAME="FaceDB";
+/* ทุก action ใช้ GET — thumb ไม่เก็บใน sheet (ใหญ่เกิน URL) */
+function doGet(e){
+  const sh=getSheet(),a=e.parameter.action||"getAll";
+  try{
+    if(a==="getAll")   return ok(getAll(sh));
+    if(a==="save")     return ok(save(sh,JSON.parse(e.parameter.data)));
+    if(a==="delete")   return ok(del(sh,e.parameter.id));
+    if(a==="update")   return ok(upd(sh,e.parameter.id,JSON.parse(e.parameter.poses)));
+    if(a==="editMeta") return ok(editMeta(sh,e.parameter.id,e.parameter.name,e.parameter.phone||""));
+    if(a==="ping")     return ok({pong:true,count:sh.getLastRow()-1});
+    return ok({error:"unknown"});
+  }catch(err){return ok({error:err.message});}
+}
+// doPost ไม่จำเป็นแล้ว แต่เก็บไว้รองรับ legacy
+function doPost(e){return doGet(e);}
+function getSheet(){
+  const ss=SpreadsheetApp.getActiveSpreadsheet();
+  let sh=ss.getSheetByName(SHEET_NAME);
+  if(!sh){
+    sh=ss.insertSheet(SHEET_NAME);
+    sh.appendRow(["id","name","phone","enrolledAt","thumb","f_desc","f_qual","f_stab","f_blur","l_desc","l_qual","l_stab","l_blur","r_desc","r_qual","r_stab","r_blur"]);
+    sh.setFrozenRows(1);
+  } else {
+    // auto-migrate: เพิ่ม phone และ thumb col ถ้าไม่มี
+    const hdr=sh.getRange(1,1,1,sh.getLastColumn()).getValues()[0].map(String);
+    if(hdr[2]!=="phone"){
+      sh.insertColumnAfter(2);
+      sh.getRange(1,3).setValue("phone");
+    }
+    // ตรวจ thumb col (ควรอยู่ที่ col 5 = index 4)
+    const hdr2=sh.getRange(1,1,1,sh.getLastColumn()).getValues()[0].map(String);
+    if(hdr2[4]!=="thumb"&&!hdr2[4].startsWith("f_")){
+      sh.insertColumnAfter(4);
+      sh.getRange(1,5).setValue("thumb");
+    }
+  }
+  return sh;
+}
+function getAll(sh){
+  const v=sh.getDataRange().getValues();
+  if(v.length<=1)return{data:[]};
+  const hdr=v[0].map(String);
+  const hasPhone=hdr[2]==="phone";
+  // รองรับ sheet เก่า (มี thumb col) และ sheet ใหม่ (ไม่มี thumb)
+  const hasThumb=hdr[hasPhone?4:3]==="thumb"||hdr[hasPhone?4:3].startsWith("data:");
+  const b=hasPhone?1:0;   // +1 ถ้ามี phone col
+  const t=hasThumb?1:0;   // +1 ถ้ามี thumb col
+  return{data:v.slice(1).filter(r=>r[0]).map(r=>({
+    id:String(r[0]),name:String(r[1]),phone:hasPhone?String(r[2]||""):"",
+    enrolledAt:String(r[2+b]||""),
+    thumb:hasThumb?String(r[3+b]||""):"",   // tinyThumb โหลดกลับมาใช้แสดงผล
+    poses:{
+      FRONTAL:r[3+b+t]?{desc:String(r[3+b+t]).split(",").map(Number),qual:+r[4+b+t],stab:+r[5+b+t],blur:+r[6+b+t]}:null,
+      LEFT:   r[7+b+t]?{desc:String(r[7+b+t]).split(",").map(Number),qual:+r[8+b+t],stab:+r[9+b+t],blur:+r[10+b+t]}:null,
+      RIGHT:  r[11+b+t]?{desc:String(r[11+b+t]).split(",").map(Number),qual:+r[12+b+t],stab:+r[13+b+t],blur:+r[14+b+t]}:null,
+    }}))};
+}
+function save(sh,d){
+  const f=v=>v?v.map(x=>(+x).toFixed(3)).join(","):"";
+  sh.appendRow([d.id,d.name,d.phone||"",d.enrolledAt,d.tinyThumb||"",
+    f(d.poses.FRONTAL?.desc),d.poses.FRONTAL?.qual||0,d.poses.FRONTAL?.stab||0,d.poses.FRONTAL?.blur||0,
+    f(d.poses.LEFT?.desc),d.poses.LEFT?.qual||0,d.poses.LEFT?.stab||0,d.poses.LEFT?.blur||0,
+    f(d.poses.RIGHT?.desc),d.poses.RIGHT?.qual||0,d.poses.RIGHT?.stab||0,d.poses.RIGHT?.blur||0]);
+  return{saved:d.id};
+}
+function del(sh,id){
+  const v=sh.getDataRange().getValues();
+  for(let i=1;i<v.length;i++){if(String(v[i][0])===String(id)){sh.deleteRow(i+1);return{deleted:id};}}
+  return{error:"not found"};
+}
+function upd(sh,id,poses){
+  const v=sh.getDataRange().getValues();
+  const hdr=v[0].map(String);
+  const b=hdr[2]==="phone"?1:0;
+  const t=(hdr[3+b]==="thumb"||String(hdr[3+b]).startsWith("data:"))?1:0;
+  for(let i=1;i<v.length;i++){if(String(v[i][0])===String(id)){const r=i+1;
+    const set=(c,p)=>{if(poses[p]){sh.getRange(r,c).setValue(poses[p].desc.map(x=>(+x).toFixed(3)).join(","));sh.getRange(r,c+1).setValue(poses[p].qual);sh.getRange(r,c+2).setValue(poses[p].stab);sh.getRange(r,c+3).setValue(poses[p].blur||0);}};
+    const base=3+b+t;set(base+1,"FRONTAL");set(base+5,"LEFT");set(base+9,"RIGHT");return{updated:id};}}return{error:"not found"};
+}
+function editMeta(sh,id,name,phone){
+  const v=sh.getDataRange().getValues();
+  const hdr=v[0].map(String),hasPhone=hdr[2]==="phone";
+  for(let i=1;i<v.length;i++){if(String(v[i][0])===String(id)){
+    sh.getRange(i+1,2).setValue(name);
+    if(hasPhone)sh.getRange(i+1,3).setValue(phone||"");
+    return{edited:id};}}
+  return{error:"not found"};
+}
+function ok(d){return ContentService.createTextOutput(JSON.stringify({ok:true,...(d||{})})).setMimeType(ContentService.MimeType.JSON);}`;
+
+  async function testConn(){
+    if(!input.trim())return;
+    setTesting(true);setResult(null);
+    try{
+      const r=await fetch(`${input.trim()}?action=ping`);
+      const d=await r.json();
+      setResult(d.ok?{ok:true,msg:`✓ CONNECTED — ${d.count||0} identities`}:{ok:false,msg:"Error: "+(d.error||"?")});
+    }catch(e){setResult({ok:false,msg:"Failed: "+e.message});}
+    setTesting(false);
+  }
+  function copyCode(){
+    navigator.clipboard?.writeText(GAS).catch(()=>{});
+    setCopied(true);setTimeout(()=>setCopied(false),2500);
+  }
+  return(<div style={{position:"fixed",inset:0,background:"rgba(0,0,0,.8)",zIndex:9998,backdropFilter:"blur(5px)",overflowY:"auto"}}>
+    <div style={{margin:"24px auto",width:560,background:"rgba(0,8,22,.98)",border:"1px solid rgba(0,150,220,.3)",borderRadius:8,padding:"22px 26px"}}>
+      <C p="tl" s={14} c="rgba(0,150,220,.45)"/><C p="tr" s={14} c="rgba(0,150,220,.45)"/>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6}}>
+        <div style={{...OR,fontSize:11,color:"#00c8ff",letterSpacing:".22em"}}>⚙ GOOGLE SHEETS SETUP</div>
+        <button onClick={onClose} style={{background:"none",border:"1px solid rgba(255,255,255,.12)",borderRadius:3,color:"rgba(255,255,255,.4)",cursor:"pointer",fontFamily:"Orbitron",fontSize:8,padding:"4px 10px"}}>✕ CLOSE</button>
+      </div>
+      <div style={{height:1,background:"linear-gradient(90deg,transparent,rgba(0,150,220,.4),transparent)",marginBottom:18}}/>
+
+      <div style={{...OR,fontSize:8,color:"rgba(0,200,255,.7)",letterSpacing:".15em",marginBottom:8}}>STEP 1 — APPS SCRIPT CODE</div>
+      <div style={{position:"relative",marginBottom:16}}>
+        <textarea readOnly value={GAS} style={{width:"100%",height:110,background:"rgba(0,0,0,.6)",border:"1px solid rgba(0,150,220,.2)",borderRadius:3,color:"rgba(0,200,100,.7)",fontFamily:"'Share Tech Mono'",fontSize:7.5,padding:"8px 10px",resize:"none",outline:"none",lineHeight:1.5}}/>
+        <button onClick={copyCode} style={{position:"absolute",top:6,right:6,background:copied?"rgba(0,255,136,.2)":"rgba(0,150,220,.12)",border:`1px solid ${copied?"rgba(0,255,136,.4)":"rgba(0,150,220,.3)"}`,borderRadius:2,color:copied?"#00ff88":"#00c8ff",cursor:"pointer",fontFamily:"Orbitron",fontSize:7,padding:"4px 10px",transition:"all .2s"}}>
+          {copied?"✓ COPIED":"COPY CODE"}
+        </button>
+      </div>
+
+      <div style={{...OR,fontSize:8,color:"rgba(0,200,255,.7)",letterSpacing:".15em",marginBottom:8}}>STEP 2 — DEPLOY</div>
+      <div style={{padding:"10px 14px",background:"rgba(0,150,220,.05)",border:"1px solid rgba(0,150,220,.1)",borderRadius:4,marginBottom:16}}>
+        {["สร้าง Google Sheet ใหม่ (ชื่ออะไรก็ได้)","Extensions → Apps Script → วาง code ด้านบน → Save (Ctrl+S)","Deploy → New deployment → Type: Web app","Execute as: Me  |  Access: Anyone","Click Deploy → Copy URL"].map((s,i)=>(
+          <div key={i} style={{display:"flex",gap:10,marginBottom:i<4?5:0}}>
+            <span style={{fontFamily:"'Share Tech Mono'",fontSize:9,color:"#00c8ff",flexShrink:0}}>{i+1}.</span>
+            <span style={{...RJ,fontSize:10,color:"rgba(160,210,240,.7)",lineHeight:1.4}}>{s}</span>
+          </div>
+        ))}
+      </div>
+
+      <div style={{...OR,fontSize:8,color:"rgba(0,200,255,.7)",letterSpacing:".15em",marginBottom:8}}>STEP 3 — PASTE URL</div>
+      <div style={{display:"flex",gap:8,marginBottom:8}}>
+        <input value={input} onChange={e=>setInput(e.target.value)} placeholder="https://script.google.com/macros/s/.../exec"
+          style={{flex:1,background:"rgba(0,15,35,.8)",border:"1px solid rgba(0,150,220,.3)",borderRadius:3,color:"#00e5ff",fontFamily:"'Share Tech Mono'",fontSize:10,padding:"9px 12px",outline:"none"}}/>
+        <button onClick={testConn} disabled={!input.trim()||testing} style={{
+          background:"rgba(0,150,220,.12)",border:"1px solid rgba(0,150,220,.3)",borderRadius:3,
+          color:"#00c8ff",cursor:"pointer",fontFamily:"Orbitron",fontSize:8,padding:"9px 14px",whiteSpace:"nowrap"}}>
+          {testing?"...":"TEST"}
+        </button>
+      </div>
+      {result&&<div style={{fontFamily:"'Share Tech Mono'",fontSize:8.5,color:result.ok?"#00ff88":"#ff5566",marginBottom:12,padding:"6px 10px",background:result.ok?"rgba(0,255,136,.06)":"rgba(255,60,60,.06)",border:`1px solid ${result.ok?"rgba(0,255,136,.2)":"rgba(255,60,60,.2)"}`,borderRadius:3}}>
+        {result.msg}
+      </div>}
+      <div style={{display:"flex",gap:10,marginTop:4}}>
+        <button onClick={onClose} style={{flex:1,background:"rgba(255,255,255,.04)",border:"1px solid rgba(255,255,255,.1)",borderRadius:3,color:"rgba(255,255,255,.35)",cursor:"pointer",fontFamily:"Orbitron",fontSize:8,padding:"10px",letterSpacing:".14em"}}>CANCEL</button>
+        <button onClick={()=>input.trim()&&onSave(input.trim())} disabled={!input.trim()} style={{flex:2,
+          background:input.trim()?"rgba(0,255,136,.11)":"rgba(0,255,136,.03)",
+          border:`1px solid ${input.trim()?"rgba(0,255,136,.42)":"rgba(0,255,136,.1)"}`,
+          borderRadius:3,color:input.trim()?"#00ff88":"rgba(0,255,136,.2)",cursor:input.trim()?"pointer":"default",
+          fontFamily:"Orbitron",fontWeight:700,fontSize:9,padding:"10px",letterSpacing:".14em",transition:"all .2s"}}>
+          ✦ SAVE &amp; CONNECT
+        </button>
+      </div>
+    </div>
+  </div>);
+}
+
+/* ── LOG LINE ── */
+function LLine({log:lg,op}){
+  const tc={i:"rgba(0,195,255,.7)",s:"#00ff88",w:"#ffaa00",e:"#ff4455"};
+  return(<div className="logIn" style={{display:"flex",gap:8,padding:"1.5px 0",flexShrink:0,opacity:op}}>
+    <span style={{fontFamily:"'Share Tech Mono'",fontSize:7.5,color:"rgba(0,150,220,.26)",flexShrink:0}}>{new Date(lg.ts).toLocaleTimeString("en-US",{hour12:false})}</span>
+    <span style={{fontFamily:"'Share Tech Mono'",fontSize:7.5,color:"rgba(0,150,220,.12)"}}>│</span>
+    <span style={{fontFamily:"'Share Tech Mono'",fontSize:8.5,color:tc[lg.tp]||tc.i,letterSpacing:".04em",whiteSpace:"nowrap"}}>{lg.txt}</span>
+  </div>);
+}
+
+/* ══════════════════════════════════════════════ MAIN APP ══════════════════════════════════════════════ */
+function App(){
+  /* ── refs ── */
+  const vRef=useRef(null), cvRef=useRef(null), loopRef=useRef(null);
+  const freezeRef=useRef(null);           // frozen-frame canvas
+  const freezeTimer=useRef(null);         // timeout to clear freeze
+  const isFrozenRef=useRef(false);        // guard: prevent re-triggering mid-freeze
+  const prevDescs=useRef({});             // keyed by face index for stability
+  const prevDesc=useRef(null);            // compat — primary face
+  const memRef=useRef({FRONTAL:null,LEFT:null,RIGHT:null});
+  const capRef=useRef({FRONTAL:0,LEFT:0,RIGHT:0});
+  const trackRef=useRef(null);
+  const frRef=useRef(0), fpsTRef=useRef(Date.now()), fpsRef=useRef(0);
+  const offscreenRef=useRef(null);
+  const dbRef=useRef([]), autoIdRef=useRef(1);
+  const modeRef=useRef("scan");
+  const updateTgtRef=useRef(null), updatePropRef=useRef({FRONTAL:null,LEFT:null,RIGHT:null});
+  const sheetUrlRef=useRef("");
+
+  /* ── state ── */
+  const[appSt,    setAppSt]    =useState("LOADING");
+  const[met,      setMet]      =useState({fps:0,lat:0,faceId:null,yaw:0,pitch:0,roll:0,qual:0,blur:0,brt:128,motion:0,stab:0,fsize:0,lconf:0,ddist:0,dconf:0,pose:"NONE",aiSt:"SCANNING",stage:"WAITING",total:0,acc:0,rej:0,faceCount:0});
+  const[mem,      setMem]      =useState({FRONTAL:null,LEFT:null,RIGHT:null});
+  const[db,       setDb]       =useState([]);
+  const[matchHit, setMatchHit] =useState(null);
+  const[logs,     setLogs]     =useState([{id:0,txt:"AXIOM-7 v"+VER+" ONLINE",tp:"i",ts:Date.now()}]);
+  const[flash,    setFlash]    =useState(false);
+  const[flashKey, setFlashKey] =useState(0);
+  const[mode,     setMode]     =useState("scan");
+  const[updTgt,   setUpdTgt]   =useState(null);
+  const[updProp,  setUpdProp]  =useState({FRONTAL:null,LEFT:null,RIGHT:null});
+  const[showSave, setShowSave] =useState(false);
+  const[frozen,   setFrozen]   =useState(false);
+  const[frozenHit,setFrozenHit]=useState(null);   // ข้อมูลที่ freeze ไว้ 15 วิ
+  const frozenHitRef=useRef(null);
+  const[sheetUrl, setSheetUrl] =useState(()=>localStorage.getItem("axiom7_url")||"");
+  const[syncSt,   setSyncSt]   =useState("off");
+  const[showCfg,  setShowCfg]  =useState(false);
+
+  const addLog=useCallback((txt,tp="i")=>{setLogs(p=>[{id:Date.now()+Math.random(),txt,tp,ts:Date.now()},...p].slice(0,50));},[]);
+
+  /* ── GAS helpers ── */
+  async function gasCall(action,params={}){
+    const u=new URL(sheetUrlRef.current);
+    u.searchParams.set("action",action);
+    Object.entries(params).forEach(([k,v])=>u.searchParams.set(k,typeof v==="object"?JSON.stringify(v):String(v)));
+    const r=await fetch(u.toString());
+    if(!r.ok)throw new Error("HTTP "+r.status);
+    return r.json();
+  }
+  async function sheetLoad(){
+    if(!sheetUrlRef.current)return;
+    setSyncSt("loading");addLog("CONNECTING TO GOOGLE SHEETS...","i");
+    try{
+      const res=await gasCall("getAll");
+      if(res.ok&&res.data){
+        const rows=res.data.map(p=>({...p,phone:p.phone||"",enrolledAt:p.enrolledAt||new Date().toISOString(),
+          thumb:p.thumb||"",   // tinyThumb จาก sheet — ใช้แสดงใน DBCard
+          poses:{
+            FRONTAL:p.poses.FRONTAL?{...p.poses.FRONTAL,thumb:p.thumb||"",ts:new Date(p.enrolledAt||Date.now())}:null,
+            LEFT:   p.poses.LEFT?  {...p.poses.LEFT,  thumb:p.thumb||"",ts:new Date(p.enrolledAt||Date.now())}:null,
+            RIGHT:  p.poses.RIGHT? {...p.poses.RIGHT, thumb:p.thumb||"",ts:new Date(p.enrolledAt||Date.now())}:null,
+          }}));
+        dbRef.current=rows;setDb(rows);
+        setSyncSt("ready");addLog(`✦ SHEET LOADED — ${rows.length} IDENTITIES`,"s");
+      }else{setSyncSt("error");addLog("SHEET ERR: "+(res.error||"?"),"e");}
+    }catch(e){setSyncSt("error");addLog("SHEET ERR: "+e.message,"e");}
+  }
+  function poseForSheet(p){
+    if(!p)return null;
+    // ปัดทศนิยม 3 ตำแหน่งให้ URL สั้น, ไม่ส่ง thumb (base64 ใหญ่เกิน)
+    return{desc:p.desc.map(x=>Math.round(x*1000)/1000),qual:p.qual,stab:p.stab,blur:p.blur||0};
+  }
+  async function sheetSave(entry){
+    if(!sheetUrlRef.current)return;setSyncSt("syncing");
+    try{
+      const res=await gasCall("save",{data:{
+        id:entry.id,name:entry.name,phone:entry.phone||"",
+        enrolledAt:new Date(entry.enrolledAt||Date.now()).toISOString(),
+        tinyThumb:entry.tinyThumb||"",
+        poses:{
+          FRONTAL:poseForSheet(entry.poses.FRONTAL),
+          LEFT:   poseForSheet(entry.poses.LEFT),
+          RIGHT:  poseForSheet(entry.poses.RIGHT),
+        }}});
+      if(res.ok){setSyncSt("ready");addLog("SHEET SYNC OK: "+entry.name,"s");}
+      else{setSyncSt("error");addLog("SYNC ERR: "+(res.error||"?"),"e");}
+    }catch(e){setSyncSt("error");addLog("SYNC ERR: "+e.message,"e");}
+  }
+  async function sheetDel(id){
+    if(!sheetUrlRef.current)return;setSyncSt("syncing");
+    try{await gasCall("delete",{id});setSyncSt("ready");}
+    catch(e){setSyncSt("error");addLog("DEL ERR: "+e.message,"e");}
+  }
+  async function sheetUpd(id,poses){
+    if(!sheetUrlRef.current)return;setSyncSt("syncing");
+    try{
+      const res=await gasCall("update",{id,poses:{
+        FRONTAL:poseForSheet(poses.FRONTAL),
+        LEFT:   poseForSheet(poses.LEFT),
+        RIGHT:  poseForSheet(poses.RIGHT),
+      }});
+      if(res.ok)setSyncSt("ready");
+      else{setSyncSt("error");addLog("UPD ERR: "+(res.error||"?"),"e");}
+    }catch(e){setSyncSt("error");addLog("UPD ERR: "+e.message,"e");}
+  }
+  async function sheetEditMeta(id,name,phone){
+    if(!sheetUrlRef.current)return;setSyncSt("syncing");
+    try{
+      await gasCall("editMeta",{id,name,phone:phone||""});
+      setSyncSt("ready");
+    }catch(e){setSyncSt("error");addLog("EDIT ERR: "+e.message,"e");}
+  }
+  function saveCfg(url){
+    const u=url.trim();localStorage.setItem("axiom7_url",u);
+    sheetUrlRef.current=u;setSheetUrl(u);setShowCfg(false);
+    if(u)sheetLoad();
+  }
+
+  /* ── boot ── */
+  useEffect(()=>{
+    const oc=document.createElement("canvas");oc.width=72;oc.height=72;
+    offscreenRef.current=oc.getContext("2d");
+    const saved=localStorage.getItem("axiom7_url")||"";
+    sheetUrlRef.current=saved;
+    boot();
+    if(saved)setTimeout(()=>sheetLoad(),2000);
+    return()=>{if(loopRef.current)cancelAnimationFrame(loopRef.current);vRef.current?.srcObject?.getTracks().forEach(t=>t.stop());};
+  },[]);
+
+  async function boot(){
+    try{
+      addLog("LOADING MODELS...","i");
+      await faceapi.nets.tinyFaceDetector.loadFromUri(MODEL_URL);
+      await faceapi.nets.faceLandmark68Net.loadFromUri(MODEL_URL);
+      await faceapi.nets.faceRecognitionNet.loadFromUri(MODEL_URL);
+      addLog("ALL MODELS ONLINE","s");
+      setAppSt("CAM");await startCam();
+    }catch(e){setAppSt("ERROR");addLog("BOOT ERR: "+e.message,"e");}
+  }
+  async function startCam(){
+    try{
+      const s=await navigator.mediaDevices.getUserMedia({video:{width:{ideal:1280},height:{ideal:720},facingMode:"user",frameRate:{ideal:30}}});
+      const v=vRef.current;if(!v)return;
+      v.srcObject=s;await new Promise(r=>{v.onloadedmetadata=()=>v.play().then(r).catch(r);});
+      addLog("CAMERA ACTIVE","s");setAppSt("ON");startLoop();
+    }catch(e){setAppSt("ERROR");addLog("CAM ERR: "+e.message,"e");}
+  }
+
+  /* ── mode change ── */
+  function changeMode(m){
+    modeRef.current=m;setMode(m);
+    if(m==="scan"){
+      memRef.current={FRONTAL:null,LEFT:null,RIGHT:null};capRef.current={FRONTAL:0,LEFT:0,RIGHT:0};
+      setMem({FRONTAL:null,LEFT:null,RIGHT:null});setMet(x=>({...x,stage:"WAITING",total:0,acc:0,rej:0}));
+      setShowSave(false);addLog("── NEW SCAN STARTED","i");
+    }else if(m==="update"){
+      updateTgtRef.current=null;updatePropRef.current={FRONTAL:null,LEFT:null,RIGHT:null};
+      capRef.current={FRONTAL:0,LEFT:0,RIGHT:0};setUpdTgt(null);setUpdProp({FRONTAL:null,LEFT:null,RIGHT:null});
+      addLog("── UPDATE MODE ACTIVE","i");
+    }else{addLog("── RECOGNITION MODE ACTIVE","i");}
+  }
+
+  /* ── save identity ── */
+  function doSave(name,phone=""){
+    const m=memRef.current;
+    const primary=m.FRONTAL||m.LEFT||m.RIGHT;
+    const entry={id:uid(),name,phone:phone||"",enrolledAt:new Date(),
+      thumb:primary?.thumb||"",           // display thumb (96px) — local only
+      tinyThumb:primary?.tinyThumb||"",   // tiny thumb (28px) — เซฟใน sheet
+      poses:{
+        FRONTAL:m.FRONTAL?{desc:m.FRONTAL.desc,qual:m.FRONTAL.qual,blur:m.FRONTAL.blur,stab:m.FRONTAL.stab,thumb:m.FRONTAL.thumb,tinyThumb:m.FRONTAL.tinyThumb,ts:m.FRONTAL.ts}:null,
+        LEFT:   m.LEFT?  {desc:m.LEFT.desc,qual:m.LEFT.qual,blur:m.LEFT.blur,stab:m.LEFT.stab,thumb:m.LEFT.thumb,tinyThumb:m.LEFT.tinyThumb,ts:m.LEFT.ts}:null,
+        RIGHT:  m.RIGHT? {desc:m.RIGHT.desc,qual:m.RIGHT.qual,blur:m.RIGHT.blur,stab:m.RIGHT.stab,thumb:m.RIGHT.thumb,tinyThumb:m.RIGHT.tinyThumb,ts:m.RIGHT.ts}:null,
+      }};
+    const next=[...dbRef.current,entry];dbRef.current=next;setDb(next);
+    memRef.current={FRONTAL:null,LEFT:null,RIGHT:null};capRef.current={FRONTAL:0,LEFT:0,RIGHT:0};
+    setMem({FRONTAL:null,LEFT:null,RIGHT:null});setShowSave(false);
+    setMet(x=>({...x,stage:"WAITING",total:0,acc:0,rej:0}));
+    addLog(`✦ SAVED: "${name}" — ${Object.values(entry.poses).filter(Boolean).length} POSES`,"s");
+    sheetSave(entry);changeMode("recognize");
+  }
+
+  /* ── save update ── */
+  function doSaveUpdate(){
+    const tgt=updateTgtRef.current,prop=updatePropRef.current;
+    if(!tgt||!Object.values(prop).some(Boolean)){addLog("NO CHANGES","w");return;}
+    const next=dbRef.current.map(p=>{
+      if(p.id!==tgt.id)return p;
+      const np={...p.poses};
+      Object.entries(prop).forEach(([pose,card])=>{if(card)np[pose]={desc:card.desc,qual:card.qual,blur:card.blur,stab:card.stab,thumb:card.thumb,ts:card.ts};});
+      const th=np.FRONTAL||np.LEFT||np.RIGHT;
+      return{...p,poses:np,thumb:th?.thumb||p.thumb};
+    });
+    dbRef.current=next;setDb(next);
+    const updPoses=Object.fromEntries(Object.entries(prop).filter(([,v])=>v));
+    sheetUpd(tgt.id,updPoses);
+    updateTgtRef.current=null;updatePropRef.current={FRONTAL:null,LEFT:null,RIGHT:null};
+    setUpdTgt(null);setUpdProp({FRONTAL:null,LEFT:null,RIGHT:null});
+    addLog(`✦ UPDATED: "${tgt.name}"  ${Object.values(prop).filter(Boolean).length} POSES`,"s");
+    changeMode("recognize");
+  }
+
+  /* ── delete ── */
+  function doDelete(id){
+    const next=dbRef.current.filter(p=>p.id!==id);dbRef.current=next;setDb(next);
+    sheetDel(id);addLog("IDENTITY REMOVED","w");
+  }
+  /* ── edit name/phone ── */
+  function doEdit(id,name,phone){
+    const next=dbRef.current.map(p=>p.id===id?{...p,name,phone}:p);
+    dbRef.current=next;setDb(next);
+    sheetEditMeta(id,name,phone);
+    addLog(`✎ EDITED: "${name}" ${phone?"☎"+phone:""}`,"s");
+  }
+
+  /* ── detection loop ── */
+  function startLoop(){
+    let lastRejLog=0;
+
+    function tryCapture(pc,qual,bl,br,stab,fsize,ps,b,desc,v,now){
+      if(pc==="TRANSITION")return;
+      if(now-(capRef.current[pc]||0)<COOLDOWN)return;
+      let why=null;
+      if(qual<Q_THRESH)why=`LOW QUALITY (${qual})`;
+      else if(bl<BLUR_MIN)why=`BLUR (${bl})`;
+      else if(br<35||br>228)why=`BRIGHTNESS (${br})`;
+      else if(fsize<1.8)why="FACE TOO SMALL";
+      else if(stab<STAB_MIN)why="UNSTABLE";
+      else{const ok=(pc==="FRONTAL"&&Math.abs(ps.yaw)<=FRONT_MAX)||(pc==="LEFT"&&ps.yaw>=-SIDE_MAX&&ps.yaw<=-SIDE_MIN)||(pc==="RIGHT"&&ps.yaw>=SIDE_MIN&&ps.yaw<=SIDE_MAX);if(!ok)why="POSE OUT OF RANGE";}
+      if(why){if(now-lastRejLog>1600){addLog(`REJECTED: ${why}`,"w");lastRejLog=now;setMet(m=>({...m,rej:m.rej+1}));}return;}
+      const ex=memRef.current[pc];if(ex&&ex.qual>=qual+4)return;
+      const{thumb,tinyThumb}=makeThumb(v,b.x,b.y,b.width,b.height);
+      const card={id:Date.now(),thumb,tinyThumb,pose:pc,yaw:ps.yaw,qual,blur:bl,stab,brt:br,desc,ts:new Date()};
+      memRef.current={...memRef.current,[pc]:card};capRef.current[pc]=Date.now();
+      setMem({...memRef.current});setFlash(true);setFlashKey(k=>k+1);
+      setTimeout(()=>setFlash(false),230);
+      addLog(`✓ CAPTURED: ${pc} | Q:${qual}`,"s");
+      const mc=Object.values(memRef.current).filter(Boolean).length;
+      setMet(m=>({...m,total:m.total+1,acc:m.acc+1,stage:["WAITING","PARTIAL","NEAR COMPLETE","COMPLETE"][mc]||"COMPLETE"}));
+      if(mc===3){
+        const nm=`SUBJ-${String(autoIdRef.current).padStart(3,"0")}`;autoIdRef.current++;
+        addLog(`◆ 3/3 AUTO-SAVING AS "${nm}"...`,"s");
+        setTimeout(()=>{if(Object.values(memRef.current).filter(Boolean).length===3)doSave(nm);},600);
+      }
+    }
+
+    function tryUpdate(pc,qual,bl,stab,fsize,ps,b,desc,v,hit,now){
+      if(pc==="TRANSITION"||!hit?.matched)return;
+      if(!updateTgtRef.current||updateTgtRef.current.id!==hit.id){
+        updateTgtRef.current=hit;setUpdTgt(hit);capRef.current={FRONTAL:0,LEFT:0,RIGHT:0};
+        addLog(`UPDATE TARGET: ${hit.name}`,"i");
+      }
+      if(now-(capRef.current[pc]||0)<COOLDOWN)return;
+      if(qual<Q_THRESH||bl<BLUR_MIN||stab<STAB_MIN||fsize<1.8)return;
+      const ok=(pc==="FRONTAL"&&Math.abs(ps.yaw)<=FRONT_MAX)||(pc==="LEFT"&&ps.yaw>=-SIDE_MAX&&ps.yaw<=-SIDE_MIN)||(pc==="RIGHT"&&ps.yaw>=SIDE_MIN&&ps.yaw<=SIDE_MAX);
+      if(!ok)return;
+      const person=dbRef.current.find(p=>p.id===hit.id);if(!person)return;
+      const stored=person.poses[pc];
+      const isNew=!stored,isBetter=stored&&qual>stored.qual+3;
+      if(!isNew&&!isBetter)return;
+      const{thumb,tinyThumb}=makeThumb(v,b.x,b.y,b.width,b.height);
+      const card={desc,qual,blur:bl,stab,thumb,tinyThumb,ts:new Date(),type:isNew?"NEW":"IMPROVE",oldQual:stored?.qual||0};
+      const np={...updatePropRef.current,[pc]:card};
+      updatePropRef.current=np;setUpdProp({...np});
+      capRef.current[pc]=Date.now();setFlash(true);setFlashKey(k=>k+1);setTimeout(()=>setFlash(false),230);
+      addLog(`${isNew?"NEW POSE":"IMPROVED"}: ${pc} Q:${stored?.qual||0}→${qual}`,"s");
+    }
+
+    /* ── freeze helpers ── */
+    function triggerFreeze(hit){
+      // ถ้ากำลัง freeze อยู่แล้ว → ไม่ reset
+      if(isFrozenRef.current)return;
+      isFrozenRef.current=true;
+      frozenHitRef.current=hit;
+      setFrozen(true);
+      setFrozenHit({...hit,frozenAt:Date.now()});
+      if(freezeTimer.current)clearTimeout(freezeTimer.current);
+      freezeTimer.current=setTimeout(()=>{
+        isFrozenRef.current=false;
+        frozenHitRef.current=null;
+        setFrozen(false);
+        setFrozenHit(null);
+      },FREEZE_HOLD);
+    }
+
+    async function tick(){
+      const v=vRef.current,cv=cvRef.current;
+      if(!v||!cv||v.readyState<2){loopRef.current=requestAnimationFrame(tick);return;}
+      frRef.current++;
+      const now=Date.now();
+      if(now-fpsTRef.current>=1000){fpsRef.current=frRef.current;frRef.current=0;fpsTRef.current=now;}
+      const t0=performance.now();
+      try{
+        const cw=cv.offsetWidth||640,ch=cv.offsetHeight||480;
+        if(cv.width!==cw||cv.height!==ch){cv.width=cw;cv.height=ch;}
+        const ctx=cv.getContext("2d");ctx.clearRect(0,0,cw,ch);
+
+        /* ── multi-face detect — inputSize 160 เร็ว 4x, เพียงพอสำหรับระยะใกล้ ── */
+        const dets=await faceapi.detectAllFaces(v,new faceapi.TinyFaceDetectorOptions({inputSize:160,scoreThreshold:.52}))
+          .withFaceLandmarks().withFaceDescriptors();
+
+        const lat=Math.round(performance.now()-t0),vr=vRect(v,cw,ch);
+
+        if(dets&&dets.length>0){
+          /* sort by box area descending — largest face = primary */
+          dets.sort((a,b)=>(b.detection.box.width*b.detection.box.height)-(a.detection.box.width*a.detection.box.height));
+          const primary=dets[0];
+
+          let primaryHit=null;
+
+          /* compute metrics for all faces */
+          const faceMets=dets.map((det,idx)=>{
+            const{detection:d,landmarks:lm,descriptor:descArr}=det,b=d.box;
+            const liveArr=Array.from(descArr);
+            const prev=prevDescs.current[idx]||null;
+            const dv=ddist(prev,liveArr);
+            prevDescs.current[idx]=liveArr;
+            const ps=estPose(lm),pc=posecat(ps.yaw);
+            const fsize=(b.width*b.height)/(v.videoWidth*v.videoHeight)*100;
+            const stab=clamp(Math.round((1-Math.min(1,dv*4.5))*100),0,100);
+            let qual=50,bl=50,br=128;
+            const oc=offscreenRef.current;
+            try{oc.drawImage(v,Math.floor(b.x),Math.floor(b.y),Math.max(1,Math.floor(b.width)),Math.max(1,Math.floor(b.height)),0,0,72,72);}catch(_){}
+            bl=calcBlur(oc,0,0,72,72);br=calcBrt(oc,0,0,72,72);
+            const cx2=(b.x+b.width/2)/v.videoWidth,cy2=(b.y+b.height/2)/v.videoHeight;
+            const cen=Math.max(0,1-Math.max(Math.abs(cx2-.5)*2.2,Math.abs(cy2-.5)*2.2));
+            const bQ=Math.min(100,bl),brQ=br<40?br*2.5:br>215?(255-br)*2.5:100,sQ=Math.min(100,fsize*22);
+            qual=clamp(Math.round(bQ*.30+brQ*.20+sQ*.18+cen*100*.17+stab*.15),0,100);
+            const hit=recognize(liveArr,dbRef.current);
+            if(idx===0){prevDesc.current=liveArr;primaryHit=hit;}
+            const sb={x:vr.x+b.x*vr.sx,y:vr.y+b.y*vr.sy,w:b.width*vr.sx,h:b.height*vr.sy};
+            const slm=lm.positions.map(pt=>({x:vr.x+pt.x*vr.sx,y:vr.y+pt.y*vr.sy}));
+            return{d,b,sb,slm,ps,pc,qual,bl,br,stab,fsize,liveArr,dv,hit};
+          });
+
+          /* draw HUD for every face */
+          faceMets.forEach((fm,idx)=>{
+            drawHUD(ctx,fm.sb,fm.slm,fm.ps,fm.qual,fm.pc,fm.d.score,fm.hit,modeRef.current,idx,dets.length);
+          });
+
+          /* primary = faceMets[0] (largest face) */
+          const pm=faceMets[0];
+
+          if(!trackRef.current){trackRef.current=uid();addLog(`${dets.length>1?dets.length+" FACES":"FACE"} DETECTED — ${trackRef.current}`,"s");}
+          setMatchHit(primaryHit);
+
+          /* freeze panel ขวาเมื่อหน้าใดหน้าหนึ่ง ≥ FREEZE_THRESH */
+          const freezeFace=faceMets.find(fm=>fm.hit&&fm.hit.conf>=FREEZE_THRESH);
+          if(freezeFace)triggerFreeze(freezeFace.hit);
+
+          setMet(m=>({...m,fps:fpsRef.current,lat,faceId:trackRef.current,
+            yaw:pm.ps.yaw,pitch:pm.ps.pitch,roll:pm.ps.roll,
+            qual:pm.qual,blur:pm.bl,brt:pm.br,
+            motion:clamp(Math.round((1-pm.stab/100)*100),0,100),stab:pm.stab,
+            fsize:Math.round(pm.fsize*10)/10,lconf:Math.round(dets[0].detection.score*100),
+            ddist:Math.round(pm.dv*1000)/1000,dconf:clamp(Math.round((1-Math.min(1,pm.dv))*100),0,100),
+            pose:pm.pc,aiSt:pm.pc,faceCount:dets.length}));
+
+          if(modeRef.current==="scan"){
+            // ลอง capture ทุก face ที่เจอ — pose ไหนมาก่อนได้ก่อน ไม่เรียงลำดับ
+            faceMets.forEach(fm=>{
+              if(!memRef.current[fm.pc])  // ข้าม pose ที่ capture แล้ว
+                tryCapture(fm.pc,fm.qual,fm.bl,fm.br,fm.stab,fm.fsize,fm.ps,fm.b,fm.liveArr,v,now);
+            });
+          }else if(modeRef.current==="update")tryUpdate(pm.pc,pm.qual,pm.bl,pm.stab,pm.fsize,pm.ps,pm.b,pm.liveArr,v,primaryHit,now);
+        }else{
+          if(trackRef.current){addLog("TRACKING LOST","w");trackRef.current=null;}
+          prevDesc.current=null;prevDescs.current={};setMatchHit(null);
+          if(modeRef.current==="update"&&updateTgtRef.current){updateTgtRef.current=null;setUpdTgt(null);}
+          setMet(m=>({...m,fps:fpsRef.current,lat:Math.round(performance.now()-t0),faceId:null,aiSt:"SCANNING",qual:0,pose:"NONE",faceCount:0}));
+        }
+      }catch(_){}
+      loopRef.current=requestAnimationFrame(tick);
+    }
+    loopRef.current=requestAnimationFrame(tick);
+  }
+
+  /* ── canvas HUD ── */
+  /* faceIdx 0 = primary (full HUD), 1+ = secondary (lighter HUD) */
+  function drawHUD(ctx,sb,slm,ps,metrics,pc,score,hit,md,faceIdx,totalFaces){
+    const qual=typeof metrics==="object"?metrics.qual:metrics;
+    const isPrimary=faceIdx===0;
+    const col=isPrimary?qCol(qual):"rgba(100,200,255,.75)";
+    ctx.save();
+    const{x,y,w,h}=sb,cl=Math.min(w,h)*.14;
+    ctx.shadowColor=col;ctx.shadowBlur=isPrimary?16:8;ctx.strokeStyle=col;ctx.lineWidth=isPrimary?1.8:1.2;
+    [[[x,y+cl],[x,y],[x+cl,y]],[[x+w-cl,y],[x+w,y],[x+w,y+cl]],
+     [[x+w,y+h-cl],[x+w,y+h],[x+w-cl,y+h]],[[x+cl,y+h],[x,y+h],[x,y+h-cl]]].forEach(pts=>{
+      ctx.beginPath();ctx.moveTo(pts[0][0],pts[0][1]);ctx.lineTo(pts[1][0],pts[1][1]);ctx.lineTo(pts[2][0],pts[2][1]);ctx.stroke();
+    });
+    ctx.globalAlpha=.06;ctx.strokeRect(x,y,w,h);ctx.globalAlpha=1;
+    if(isPrimary){
+      ctx.globalAlpha=.2;ctx.beginPath();ctx.moveTo(x+w/2-14,y+h/2);ctx.lineTo(x+w/2+14,y+h/2);ctx.moveTo(x+w/2,y+h/2-14);ctx.lineTo(x+w/2,y+h/2+14);ctx.stroke();ctx.globalAlpha=1;
+    }
+    /* landmarks */
+    const KEY=new Set([27,30,33,36,39,42,45,48,54]);
+    slm.forEach((pt,i)=>{ctx.beginPath();ctx.arc(pt.x,pt.y,KEY.has(i)?(isPrimary?2.2:1.5):0.8,0,Math.PI*2);ctx.fillStyle=KEY.has(i)?col:col+"55";ctx.shadowBlur=KEY.has(i)?(isPrimary?8:4):0;ctx.shadowColor=col;ctx.fill();});
+    ctx.shadowBlur=0;
+    /* face index badge for secondary faces */
+    if(!isPrimary){
+      const badge=`FACE ${faceIdx+1}`;
+      const bw=badge.length*5.5+10;
+      ctx.globalAlpha=.6;ctx.fillStyle="rgba(0,4,14,.85)";ctx.fillRect(x,y-16,bw,14);
+      ctx.globalAlpha=1;ctx.fillStyle=col;ctx.font='8px "Share Tech Mono",monospace';
+      ctx.fillText(badge,x+4,y-4);
+      /* show match if recognized */
+      if(hit){
+        const c=hit.matched?"#00ff88":"#ffaa00";
+        const lbl=`${hit.matched?"✓":"~"}${hit.name} ${hit.conf}%`;
+        const hw=lbl.length*5.5+8;
+        ctx.globalAlpha=.72;ctx.fillStyle=hit.matched?"rgba(0,16,8,.88)":"rgba(16,10,0,.88)";ctx.fillRect(x,y+h+2,hw,14);
+        ctx.globalAlpha=1;ctx.fillStyle=c;ctx.font='8px "Share Tech Mono",monospace';ctx.fillText(lbl,x+4,y+h+12);
+      }
+      ctx.restore();return;
+    }
+    /* primary face — full labels */
+    const l1=`${pc}  Q:${qual}  ${md.toUpperCase()}${totalFaces>1?`  ×${totalFaces}`:""}`;
+    const l2=`YAW:${ps.yaw}°  PCH:${ps.pitch}°  RLL:${ps.roll}°`;
+    const fw=Math.max(l1.length,l2.length)*6.1+12;
+    ctx.globalAlpha=.7;ctx.fillStyle="rgba(0,4,14,.9)";ctx.fillRect(x,y-40,fw,36);
+    ctx.globalAlpha=1;ctx.fillStyle=col;ctx.font='9px "Share Tech Mono",monospace';
+    ctx.fillText(l1,x+5,y-24);ctx.fillText(l2,x+5,y-8);
+    if(hit){
+      const c=hit.matched?"#00ff88":"#ffaa00";
+      const lbl=`${hit.matched?"✓":"~"} ${hit.name}  ${hit.conf}%`;
+      const bw=lbl.length*6.2+12;
+      ctx.globalAlpha=.78;ctx.fillStyle=hit.matched?"rgba(0,20,10,.9)":"rgba(18,12,0,.9)";ctx.fillRect(x,y+h+4,bw,18);
+      ctx.globalAlpha=1;ctx.fillStyle=c;ctx.font='9px "Share Tech Mono",monospace';ctx.fillText(lbl,x+5,y+h+15);
+    }
+    ctx.restore();
+  }
+
+  /* ── derived ── */
+  const mc  =Object.values(mem).filter(Boolean).length;
+  const SC  ={ON:"#00ff88",ERROR:"#ff4455",LOADING:"#ffaa00",CAM:"#ffaa00"};
+  const PC  ={FRONTAL:"#00ff88",LEFT:"#44aaff",RIGHT:"#44aaff",SCANNING:"#ffaa00",TRANSITION:"#ffaa00",NONE:"#ff5566"};
+  const PNL ={background:"rgba(0,8,20,.88)",border:"1px solid rgba(0,150,220,.12)",borderRadius:4,position:"relative",overflow:"hidden"};
+  const OR  ={fontFamily:"Orbitron,monospace",fontWeight:700};
+  const MN  ={fontFamily:"'Share Tech Mono',monospace"};
+  const MCL ={
+    recognize:{col:"#00c8ff",bg:"rgba(0,180,255,.14)",br:"rgba(0,180,255,.42)",glow:"0 0 20px rgba(0,180,255,.18)"},
+    scan:     {col:"#00ff88",bg:"rgba(0,255,136,.12)",br:"rgba(0,255,136,.42)",glow:"0 0 20px rgba(0,255,136,.15)"},
+    update:   {col:"#ffaa00",bg:"rgba(255,170,0,.12)", br:"rgba(255,170,0,.42)", glow:"0 0 20px rgba(255,170,0,.14)"},
+  };
+  const leftRows=[
+    {sec:"RECOGNITION"},
+    {lbl:"STATUS",  val:matchHit?(matchHit.matched?"IDENTIFIED":"NEAR MATCH"):(db.length>0&&trackRef.current?"UNIDENTIFIED":"—"),
+     col:matchHit?(matchHit.matched?"#00ff88":"#ffaa00"):db.length>0&&trackRef.current?"#ff5566":"rgba(255,255,255,.2)"},
+    {lbl:"ID'D AS", val:matchHit?matchHit.name:"—",          col:matchHit?.matched?"#00ff88":"rgba(255,255,255,.2)"},
+    {lbl:"CONF",    val:matchHit?`${matchHit.conf}%`:"—",     col:matchHit?(matchHit.conf>=MATCH_CONF?"#00ff88":"#ffaa00"):"rgba(255,255,255,.2)"},
+    {lbl:"DIST",    val:matchHit?`${matchHit.dist}`:"—",      col:matchHit?(matchHit.dist<.24?"#00ff88":"#ffaa00"):"rgba(255,255,255,.2)"},
+    {sec:"TRACKING"},
+    {lbl:"ID",    val:met.faceId||"——————",col:"#00c8ff"},
+    {lbl:"MODE",  val:mode.toUpperCase(),  col:MCL[mode].col},
+    {lbl:"POSE",  val:met.pose,            col:PC[met.pose]||"#00c8ff"},
+    {sec:"ANGLES"},
+    {lbl:"YAW",   val:`${met.yaw}°`,   col:Math.abs(met.yaw)<14?"#00ff88":"#ffaa00"},
+    {lbl:"PITCH", val:`${met.pitch}°`, col:Math.abs(met.pitch)<22?"#00c8ff":"#ffaa00"},
+    {lbl:"ROLL",  val:`${met.roll}°`,  col:Math.abs(met.roll)<12?"#00c8ff":"#ffaa00"},
+    {sec:"QUALITY"},
+    {bar:true,lbl:"QUALITY",   val:met.qual},
+    {bar:true,lbl:"BLUR",      val:met.blur},
+    {bar:true,lbl:"STABILITY", val:met.stab},
+    {sec:"ENROLLMENT"},
+    {lbl:"STAGE",  val:met.stage,        col:met.stage==="COMPLETE"?"#00ff88":"#00c8ff",big:true},
+    {lbl:"ACCEPT", val:String(met.acc),  col:"#00ff88"},
+    {lbl:"REJECT", val:String(met.rej),  col:"#ff4455"},
+    {lbl:"FACES",  val:String(met.faceCount||0), col:(met.faceCount||0)>1?"#ffaa00":"#00c8ff"},
+    {lbl:"DB",     val:`${db.length} IDs`,col:"#00c8ff"},
+    {sec:"PERF"},
+    {lbl:"LATENCY",val:`${met.lat}ms`,col:met.lat<120?"#00ff88":"#ffaa00"},
+    {lbl:"FPS",    val:String(met.fps),col:met.fps>18?"#00ff88":met.fps>10?"#ffaa00":"#ff4455"},
+  ];
+  const bC=met.qual>=Q_THRESH?"rgba(0,255,136,.36)":"rgba(0,150,220,.12)";
+  const cC=met.qual>=Q_THRESH?"rgba(0,255,136,.52)":"rgba(0,150,220,.35)";
+  const SYNC_INFO={
+    off:  {col:"rgba(255,255,255,.2)", bg:"transparent",           br:"rgba(255,255,255,.08)", dot:"rgba(255,255,255,.2)", lbl:"NO SHEET"},
+    loading:{col:"#ffcc00",           bg:"rgba(255,200,0,.05)",    br:"rgba(255,200,0,.22)",   dot:"#ffcc00",             lbl:"LOADING..."},
+    ready:  {col:"#00ff88",           bg:"rgba(0,255,136,.06)",    br:"rgba(0,255,136,.25)",   dot:"#00ff88",             lbl:"SHEET OK"},
+    syncing:{col:"#ffcc00",           bg:"rgba(255,200,0,.05)",    br:"rgba(255,200,0,.22)",   dot:"#ffcc00",             lbl:"SYNCING..."},
+    error:  {col:"#ff5555",           bg:"rgba(255,60,60,.06)",    br:"rgba(255,60,60,.2)",    dot:"#ff5555",             lbl:"SHEET ERR"},
+  };
+  const si=SYNC_INFO[syncSt]||SYNC_INFO.off;
+
+  return(
+    <div style={{background:"radial-gradient(ellipse at 44% 50%,#010e22 0%,#010a18 50%,#000508 100%)",
+      fontFamily:"Rajdhani,sans-serif",color:"#88bbd4",position:"fixed",inset:0,
+      display:"flex",flexDirection:"column",overflow:"hidden",userSelect:"none"}}>
+
+      {/* Grid */}
+      <svg style={{position:"absolute",inset:0,width:"100%",height:"100%",opacity:.035,pointerEvents:"none",zIndex:0}}>
+        <defs><pattern id="gr" width="36" height="36" patternUnits="userSpaceOnUse">
+          <path d="M36 0 L0 0 0 36" fill="none" stroke="#00c8ff" strokeWidth=".35"/></pattern></defs>
+        <rect width="100%" height="100%" fill="url(#gr)"/>
+      </svg>
+      <div style={{position:"absolute",inset:0,background:"radial-gradient(ellipse at 50% 50%,transparent 52%,rgba(0,0,0,.6) 100%)",pointerEvents:"none",zIndex:0}}/>
+      {flash&&<div key={flashKey} className="flash" style={{position:"fixed",inset:0,pointerEvents:"none",zIndex:9997,background:"rgba(0,200,255,.11)",border:"2px solid rgba(0,255,136,.25)"}}/>}
+      {showSave&&<SaveModal mem={mem} onSave={doSave} onCancel={()=>setShowSave(false)}/>}
+      {showCfg&&<SettingsModal url={sheetUrl} onSave={saveCfg} onClose={()=>setShowCfg(false)}/>}
+
+      {/* ── HEADER ── */}
+      <div style={{height:32,padding:"0 10px",flexShrink:0,display:"flex",alignItems:"center",
+        justifyContent:"space-between",background:"rgba(0,3,12,.95)",
+        borderBottom:"1px solid rgba(0,140,210,.09)",position:"relative",zIndex:10}}>
+        <div style={{display:"flex",alignItems:"center",gap:9}}>
+          <div style={{width:7,height:7,borderRadius:"50%",background:SC[appSt]||"#555",boxShadow:`0 0 9px ${SC[appSt]||"#555"}`}} className="blink"/>
+          <svg width="16" height="16" viewBox="0 0 18 18">
+            <polygon points="9,1 17,5.5 17,12.5 9,17 1,12.5 1,5.5" fill="none" stroke="#00c8ff" strokeWidth=".9" opacity=".5"/>
+            <circle cx="9" cy="9" r="2.8" fill="none" stroke="#00c8ff" strokeWidth=".9" opacity=".8"/>
+          </svg>
+          <span style={{...OR,fontSize:10,color:"#00c8ff",letterSpacing:".28em"}}>AXIOM-7 BIOMETRIC TERMINAL</span>
+          <span style={{...MN,fontSize:9,color:"rgba(0,200,255,.55)",background:"rgba(0,150,220,.08)",border:"1px solid rgba(0,150,220,.2)",borderRadius:2,padding:"1px 6px",letterSpacing:".08em"}}>v{VER}</span>
+        </div>
+        <div style={{display:"flex",alignItems:"center",gap:12}}>
+          {matchHit?.matched&&<div style={{display:"flex",alignItems:"center",gap:7,background:"rgba(0,255,136,.07)",border:"1px solid rgba(0,255,136,.28)",borderRadius:3,padding:"1px 10px",animation:"matchGlow 1.8s ease-in-out infinite"}}>
+            <div style={{width:5,height:5,borderRadius:"50%",background:"#00ff88",boxShadow:"0 0 6px #00ff88"}} className="blink"/>
+            <span style={{...OR,fontSize:8,color:"#00ff88",letterSpacing:".1em"}}>{matchHit.name}</span>
+            <span style={{...MN,fontSize:10,color:"#00ff88",fontWeight:700}}>{matchHit.conf}%</span>
+          </div>}
+          {matchHit&&!matchHit.matched&&<div style={{display:"flex",alignItems:"center",gap:6,background:"rgba(255,170,0,.05)",border:"1px solid rgba(255,170,0,.2)",borderRadius:3,padding:"1px 9px",animation:"nearGlow 2s ease-in-out infinite"}}>
+            <span style={{...OR,fontSize:8,color:"#ffaa00"}}>~{matchHit.name}</span>
+            <span style={{...MN,fontSize:9,color:"#ffaa00"}}>{matchHit.conf}%</span>
+          </div>}
+          <span style={{...MN,fontSize:10,color:met.fps>18?"#00ff88":met.fps>10?"#ffaa00":"#ff4455"}}>{met.fps}<span style={{fontSize:7,color:"rgba(120,185,225,.35)"}}> FPS</span></span>
+          <span style={{...MN,fontSize:9,color:SC[appSt]||"#555"}}>{appSt}</span>
+          <span style={{...MN,fontSize:9,color:"rgba(0,200,255,.5)"}}>DB:{db.length}</span>
+          {/* Sync badge */}
+          <div style={{display:"flex",alignItems:"center",gap:5,padding:"2px 9px",borderRadius:3,
+            border:`1px solid ${si.br}`,background:si.bg}}>
+            <div style={{width:5,height:5,borderRadius:"50%",background:si.dot,boxShadow:syncSt==="ready"?"0 0 6px #00ff88":"none"}}
+              className={syncSt==="syncing"||syncSt==="loading"?"blink":""}/>
+            <span style={{...MN,fontSize:7.5,color:si.col}}>{si.lbl}</span>
+          </div>
+          {/* Settings */}
+          <button onClick={()=>setShowCfg(true)} style={{background:"rgba(0,150,220,.08)",border:"1px solid rgba(0,150,220,.2)",borderRadius:3,color:"rgba(0,200,255,.6)",cursor:"pointer",fontFamily:"Orbitron",fontSize:9,padding:"3px 10px",transition:"all .2s"}}
+            onMouseEnter={e=>e.currentTarget.style.background="rgba(0,150,220,.18)"}
+            onMouseLeave={e=>e.currentTarget.style.background="rgba(0,150,220,.08)"}>⚙</button>
+        </div>
+      </div>
+
+      {/* ── MODE BAR ── */}
+      <div style={{height:64,flexShrink:0,display:"flex",alignItems:"center",gap:6,padding:"0 12px",
+        background:"rgba(0,3,14,.97)",borderBottom:"2px solid rgba(0,150,220,.15)",position:"relative",zIndex:9,boxShadow:"0 4px 24px rgba(0,0,0,.5)"}}>
+        <div style={{display:"flex",flexDirection:"column",alignItems:"center",marginRight:8,paddingRight:12,borderRight:"1px solid rgba(0,150,220,.12)"}}>
+          <span style={{...OR,fontSize:6,color:"rgba(0,150,220,.35)",letterSpacing:".22em"}}>SYSTEM</span>
+          <span style={{...OR,fontSize:7,color:"rgba(0,150,220,.5)",letterSpacing:".2em"}}>MODE</span>
+        </div>
+        {[
+          {id:"recognize",icon:"◉",label:"AUTO READ",   sub:"อ่านใบหน้า"},
+          {id:"scan",     icon:"⊕",label:"NEW SCAN",    sub:"เริ่ม Scan"},
+          {id:"update",   icon:"↻",label:"UPDATE DATA", sub:"ปรับปรุงข้อมูล"},
+        ].map(btn=>{
+          const act=mode===btn.id,m=MCL[btn.id];
+          return(<button key={btn.id} onClick={()=>changeMode(btn.id)} style={{
+            height:46,minWidth:148,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:2,
+            fontFamily:"Orbitron,monospace",cursor:"pointer",transition:"all .25s",
+            background:act?m.bg:"rgba(255,255,255,.02)",
+            border:`1.5px solid ${act?m.br:"rgba(0,150,220,.1)"}`,
+            borderRadius:5,boxShadow:act?m.glow:"none",padding:"0 20px"}}>
+            <div style={{display:"flex",alignItems:"center",gap:7}}>
+              <span style={{fontSize:15,color:act?m.col:"rgba(120,185,225,.28)",lineHeight:1}}>{btn.icon}</span>
+              <span style={{fontSize:12,fontWeight:900,letterSpacing:".18em",color:act?m.col:"rgba(120,185,225,.32)",textShadow:act?`0 0 12px ${m.col}70`:"none",transition:"all .25s"}}>{btn.label}</span>
+            </div>
+            <span style={{fontFamily:"Rajdhani,sans-serif",fontWeight:500,fontSize:9,color:act?`${m.col}80`:"rgba(0,150,220,.2)",letterSpacing:".08em",transition:"all .25s"}}>{btn.sub}</span>
+          </button>);
+        })}
+
+        <div style={{marginLeft:10,paddingLeft:10,borderLeft:"1px solid rgba(0,150,220,.1)",display:"flex",gap:6}}>
+          {mode==="update"&&<button onClick={doSaveUpdate} style={{
+            height:46,minWidth:130,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:2,
+            fontFamily:"Orbitron,monospace",cursor:"pointer",transition:"all .25s",
+            background:Object.values(updProp).some(Boolean)?"rgba(255,170,0,.14)":"rgba(255,170,0,.03)",
+            border:`1.5px solid ${Object.values(updProp).some(Boolean)?"rgba(255,170,0,.5)":"rgba(255,170,0,.12)"}`,
+            borderRadius:5,boxShadow:Object.values(updProp).some(Boolean)?"0 0 18px rgba(255,170,0,.18)":"none",padding:"0 18px"}}>
+            <span style={{fontSize:11,fontWeight:900,letterSpacing:".14em",color:Object.values(updProp).some(Boolean)?"#ffaa00":"rgba(255,170,0,.25)"}}>✦ SAVE UPDATE</span>
+            <span style={{fontFamily:"Rajdhani",fontWeight:500,fontSize:9,color:Object.values(updProp).some(Boolean)?"rgba(255,170,0,.6)":"rgba(255,170,0,.18)"}}>
+              {Object.values(updProp).filter(Boolean).length} changes queued
+            </span>
+          </button>}
+          {mode==="scan"&&mc>=1&&<button onClick={()=>setShowSave(true)} style={{
+            height:46,minWidth:120,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:2,
+            fontFamily:"Orbitron,monospace",cursor:"pointer",transition:"all .25s",
+            background:"rgba(0,200,255,.11)",border:"1.5px solid rgba(0,200,255,.38)",
+            borderRadius:5,boxShadow:"0 0 16px rgba(0,200,255,.14)",padding:"0 18px"}}
+            onMouseEnter={e=>e.currentTarget.style.background="rgba(0,200,255,.22)"}
+            onMouseLeave={e=>e.currentTarget.style.background="rgba(0,200,255,.11)"}>
+            <span style={{fontSize:11,fontWeight:900,letterSpacing:".14em",color:"#00c8ff"}}>SAVE NOW</span>
+            <span style={{fontFamily:"Rajdhani",fontWeight:500,fontSize:9,color:"rgba(0,200,255,.6)"}}>{mc}/3 poses</span>
+          </button>}
+        </div>
+
+        <div style={{marginLeft:"auto",textAlign:"right"}}>
+          <div style={{...OR,fontSize:8,letterSpacing:".1em",marginBottom:2,color:MCL[mode].col}}>
+            {mode==="recognize"?"RECOGNITION ACTIVE":mode==="scan"?"PASSIVE ENROLLMENT":"UPDATE MODE"}
+          </div>
+          <div style={{...MN,fontSize:7,color:"rgba(0,150,220,.3)"}}>
+            {mode==="recognize"?`THRESHOLD: ${MATCH_CONF}% · DB: ${db.length} IDs`:mode==="scan"?"3/3 AUTO-SAVES":"BETTER FRAME = AUTO REPLACE"}
+          </div>
+        </div>
+      </div>
+
+      {/* ── 3 COLUMNS ── */}
+      <div style={{flex:1,display:"flex",gap:5,padding:"5px",minHeight:0,position:"relative",zIndex:1}}>
+
+        {/* LEFT */}
+        <div style={{...PNL,width:"19%",display:"flex",flexDirection:"column",padding:"6px 8px",overflow:"hidden"}}>
+          <C p="tl"/><C p="tr"/><C p="bl"/><C p="br"/>
+          <div style={{position:"absolute",top:0,left:"20%",right:"20%",height:1,background:"linear-gradient(90deg,transparent,rgba(0,150,220,.38),transparent)"}}/>
+          <div style={{...OR,fontSize:8,color:"rgba(0,150,220,.52)",letterSpacing:".2em",marginBottom:5,flexShrink:0}}>AI TELEMETRY</div>
+          <div style={{flex:1,overflow:"hidden"}}>{leftRows.map((r,i)=><MRow key={i} row={r}/>)}</div>
+        </div>
+
+        {/* CENTER */}
+        <div style={{flex:1,display:"flex",flexDirection:"column",minWidth:0}}>
+          <div style={{...PNL,flex:1,border:`1px solid ${bC}`,transition:"border-color .4s"}}>
+            {["tl","tr","bl","br"].map(p=><C key={p} p={p} s={22} c={cC}/>)}
+            <div style={{position:"absolute",top:0,left:"15%",right:"15%",height:1,background:`linear-gradient(90deg,transparent,${met.qual>=Q_THRESH?"rgba(0,255,136,.42)":"rgba(0,150,220,.28)"},transparent)`,transition:"background .4s"}}/>
+            <video ref={vRef} autoPlay muted playsInline style={{position:"absolute",inset:0,width:"100%",height:"100%",objectFit:"contain",transform:"scaleX(-1)",opacity:appSt==="ON"?1:.15,transition:"opacity .5s"}}/>
+            <canvas ref={cvRef} style={{position:"absolute",inset:0,width:"100%",height:"100%",transform:"scaleX(-1)",pointerEvents:"none"}}/>
+            {/* freeze badge */}
+            {frozen&&<div style={{position:"absolute",top:10,right:14,zIndex:9,...MN,fontSize:8,color:"#00ff88",background:"rgba(0,16,8,.9)",border:"1px solid rgba(0,255,136,.4)",borderRadius:3,padding:"3px 10px",letterSpacing:".08em",whiteSpace:"nowrap"}} className="blink">
+              ⬛ MATCH LOCKED
+            </div>}
+            {/* scan progress — แสดง pose ที่ capture แล้ว */}
+            {mode==="scan"&&appSt==="ON"&&<div style={{position:"absolute",top:"50%",left:"50%",transform:"translate(-50%,-50%)",zIndex:9,
+              display:"flex",gap:10,pointerEvents:"none"}}>
+              {["FRONTAL","LEFT","RIGHT"].map(p=>(
+                <div key={p} style={{display:"flex",flexDirection:"column",alignItems:"center",gap:3}}>
+                  <div style={{width:8,height:8,borderRadius:"50%",
+                    background:mem[p]?"#00ff88":"rgba(255,255,255,.15)",
+                    boxShadow:mem[p]?"0 0 8px #00ff88":"none",transition:"all .3s"}}/>
+                  <span style={{...MN,fontSize:7,color:mem[p]?"#00ff88":"rgba(255,255,255,.2)"}}>{p[0]}</span>
+                </div>
+              ))}
+            </div>}
+            <div style={{position:"absolute",inset:0,zIndex:5,pointerEvents:"none",backgroundImage:"repeating-linear-gradient(0deg,transparent,transparent 2px,rgba(0,180,255,.006) 2px,rgba(0,180,255,.006) 4px)"}}/>
+            {appSt==="ON"&&<div style={{position:"absolute",left:0,right:0,height:2,background:"linear-gradient(90deg,transparent,rgba(0,190,255,.22) 50%,transparent)",animation:"sweep 5s linear infinite",zIndex:6,pointerEvents:"none"}}/>}
+
+            {/* สถานะ live ล่างกล้อง (เล็ก) */}
+            {mode==="recognize"&&matchHit?.matched&&!frozen&&<div style={{position:"absolute",bottom:8,left:10,right:10,zIndex:8,
+              background:"rgba(0,4,14,.82)",border:"1px solid rgba(0,255,136,.22)",borderRadius:3,
+              padding:"5px 12px",display:"flex",alignItems:"center",gap:10,animation:"idIn .2s ease-out"}}>
+              <div style={{width:28,height:28,borderRadius:2,overflow:"hidden",border:"1px solid rgba(0,255,136,.4)",flexShrink:0}}>
+                <img src={matchHit.thumb||""} style={{width:"100%",height:"100%",objectFit:"cover",transform:"scaleX(-1)"}}/>
+              </div>
+              <div style={{flex:1,minWidth:0}}>
+                <div style={{...OR,fontSize:10,color:"#00ff88",letterSpacing:".08em",whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}}>{matchHit.name}</div>
+                {matchHit.phone&&<div style={{...MN,fontSize:8,color:"rgba(0,255,200,.6)"}}>☎ {matchHit.phone}</div>}
+              </div>
+              <span style={{...MN,fontSize:18,color:"#00ff88",fontWeight:700,flexShrink:0}}>{matchHit.conf}%</span>
+            </div>}
+            {mode==="recognize"&&matchHit&&!matchHit.matched&&!frozen&&<div style={{position:"absolute",bottom:8,left:10,right:10,zIndex:8,
+              background:"rgba(0,4,14,.8)",border:"1px solid rgba(255,170,0,.2)",borderRadius:3,
+              padding:"4px 12px",display:"flex",alignItems:"center",gap:8,animation:"idIn .2s ease-out"}}>
+              <div style={{width:24,height:24,borderRadius:2,overflow:"hidden",border:"1px solid rgba(255,170,0,.3)",flexShrink:0}}>
+                <img src={matchHit.thumb||""} style={{width:"100%",height:"100%",objectFit:"cover",transform:"scaleX(-1)"}}/>
+              </div>
+              <span style={{...MN,fontSize:9,color:"#ffaa00"}}>~ {matchHit.name}</span>
+              <span style={{...MN,fontSize:13,color:"rgba(255,170,0,.8)",marginLeft:"auto"}}>{matchHit.conf}%</span>
+            </div>}
+            {mode==="recognize"&&!matchHit&&db.length>0&&trackRef.current&&!frozen&&<div style={{position:"absolute",bottom:8,left:"50%",transform:"translateX(-50%)",zIndex:8,
+              background:"rgba(0,4,14,.82)",border:"1px solid rgba(255,60,70,.18)",borderRadius:3,
+              padding:"4px 16px",...MN,fontSize:9,color:"rgba(255,60,70,.6)",letterSpacing:".12em",whiteSpace:"nowrap"}}>
+              ✗ UNIDENTIFIED
+            </div>}
+
+            {appSt!=="ON"&&<div style={{position:"absolute",inset:0,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:12,zIndex:10}}>
+              <svg width="52" height="52" viewBox="0 0 52 52" className="spin" style={{opacity:.35}}>
+                <circle cx="26" cy="26" r="22" fill="none" stroke="#00c8ff" strokeWidth=".8" strokeDasharray="10 5"/>
+              </svg>
+              <div style={{...OR,fontSize:12,color:"#00c8ff",opacity:.7,letterSpacing:".24em",textAlign:"center"}}>
+                {appSt==="LOADING"?"LOADING MODELS...":appSt==="CAM"?"AWAITING CAMERA...":"ERROR — RELOAD PAGE"}
+              </div>
+            </div>}
+            {appSt==="ON"&&<>
+              <div style={{position:"absolute",top:10,left:14,zIndex:10,...MN,fontSize:7,color:"rgba(0,190,255,.35)",lineHeight:1.8}}>
+                <div>1280×720</div><div style={{color:MCL[mode].col}}>{mode.toUpperCase()}</div>
+              </div>
+              <div style={{position:"absolute",top:10,right:14,zIndex:10,textAlign:"right",...MN,fontSize:7,lineHeight:1.8}}>
+                <div style={{color:PC[met.pose]||"rgba(0,190,255,.35)",transition:"color .3s"}}>{met.pose}</div>
+                <div style={{color:"rgba(0,190,255,.35)"}}>Q:{met.qual}</div>
+              </div>
+              <div style={{position:"absolute",bottom:mode==="recognize"&&(matchHit||db.length>0)&&!frozen?58:8,left:10,right:10,display:"flex",justifyContent:"space-between",zIndex:10,transition:"bottom .3s"}}>
+                <div style={{display:"flex",alignItems:"center",gap:8}}>
+                  <div style={{width:5,height:5,borderRadius:"50%",background:MCL[mode].col,boxShadow:`0 0 6px ${MCL[mode].col}`}} className="blink"/>
+                  <span style={{...MN,fontSize:7,color:"rgba(0,190,255,.35)"}}>{mode==="recognize"?"RECOGNITION ACTIVE":mode==="scan"?"PASSIVE ENROLLMENT":"UPDATE MODE"}</span>
+                  {(met.faceCount||0)>0&&<span style={{...MN,fontSize:7,color:(met.faceCount||0)>1?"#ffaa00":"rgba(0,190,255,.55)",background:"rgba(0,4,14,.7)",border:"1px solid rgba(0,150,220,.2)",borderRadius:2,padding:"0 5px"}}>
+                    {met.faceCount||0} FACE{(met.faceCount||0)>1?"S":""}
+                  </span>}
+                </div>
+                <div style={{display:"flex",gap:10,...MN,fontSize:7,color:"rgba(0,190,255,.4)"}}>
+                  <span style={{color:met.fps>18?"#00ff88":"#ffaa00"}}>{met.fps} FPS</span>
+                  <span>{met.lat}ms</span>
+                  {met.faceId&&<span style={{color:"rgba(0,190,255,.6)"}}>{met.faceId}</span>}
+                </div>
+              </div>
+            </>}
+          </div>
+        </div>
+
+        {/* RIGHT */}
+        <div style={{...PNL,width:"21%",display:"flex",flexDirection:"column",padding:"6px 8px",gap:5,overflow:"hidden"}}>
+          <C p="tl"/><C p="tr"/><C p="bl"/><C p="br"/>
+          <div style={{position:"absolute",top:0,left:"20%",right:"20%",height:1,background:"linear-gradient(90deg,transparent,rgba(0,150,220,.38),transparent)"}}/>
+          <div style={{...OR,fontSize:7.5,letterSpacing:".18em",flexShrink:0,color:frozen&&mode==="recognize"?"#00ff88":MCL[mode].col,display:"flex",alignItems:"center",gap:6}}>
+            {mode==="recognize"?(frozen?"⬛ MATCH LOCKED":"IDENTITY DATABASE"):mode==="scan"?"ENROLLMENT BUFFER":"UPDATE PREVIEW"}
+            {frozen&&mode==="recognize"&&<span style={{...MN,fontSize:7,color:"rgba(0,255,136,.5)",fontWeight:400}}>{Math.ceil(FREEZE_HOLD/1000)}s</span>}
+          </div>
+
+          {mode==="recognize"&&(
+            <div style={{flex:1,display:"flex",flexDirection:"column",gap:5,overflow:"hidden",minHeight:0}}>
+
+              {/* FROZEN DETECTED CARD — ค้างไว้ 15 วิเมื่อ match ≥ 70% */}
+              {frozenHit&&<div className="cardIn" style={{flexShrink:0,border:`2px solid ${frozenHit.matched?"rgba(0,255,136,.55)":"rgba(255,170,0,.45)"}`,borderRadius:5,
+                padding:"10px 10px 8px",background:frozenHit.matched?"rgba(0,255,136,.07)":"rgba(255,170,0,.06)",
+                position:"relative",overflow:"hidden",animation:"matchGlow 1.8s ease-in-out infinite"}}>
+                <C p="tl" s={9} c={frozenHit.matched?"rgba(0,255,136,.5)":"rgba(255,170,0,.4)"}/>
+                <C p="tr" s={9} c={frozenHit.matched?"rgba(0,255,136,.5)":"rgba(255,170,0,.4)"}/>
+                {/* timer bar */}
+                <div style={{position:"absolute",bottom:0,left:0,height:2,background:frozenHit.matched?"#00ff88":"#ffaa00",
+                  width:"100%",transformOrigin:"left",
+                  animation:`freezeBar ${FREEZE_HOLD/1000}s linear forwards`}}/>
+                <div style={{display:"flex",gap:9,alignItems:"flex-start"}}>
+                  <div style={{width:64,height:64,borderRadius:3,overflow:"hidden",flexShrink:0,
+                    border:`2px solid ${frozenHit.matched?"rgba(0,255,136,.5)":"rgba(255,170,0,.4)"}`,
+                    boxShadow:frozenHit.matched?"0 0 14px rgba(0,255,136,.25)":"0 0 14px rgba(255,170,0,.2)"}}>
+                    <img src={frozenHit.thumb||""} style={{width:"100%",height:"100%",objectFit:"cover",transform:"scaleX(-1)"}}/>
+                  </div>
+                  <div style={{flex:1,minWidth:0}}>
+                    <div style={{...MN,fontSize:7.5,color:frozenHit.matched?"rgba(0,255,136,.7)":"rgba(255,170,0,.7)",letterSpacing:".18em",marginBottom:3}}>
+                      {frozenHit.matched?"● IDENTIFIED":"~ NEAR MATCH"}
+                    </div>
+                    <div style={{...OR,fontSize:13,color:frozenHit.matched?"#ffffff":"#ffaa00",fontWeight:900,lineHeight:1.2,
+                      whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis",
+                      textShadow:frozenHit.matched?"0 0 12px rgba(0,255,136,.4)":"0 0 12px rgba(255,170,0,.3)"}}>
+                      {frozenHit.name}
+                    </div>
+                    {frozenHit.phone&&<div style={{...MN,fontSize:9,color:frozenHit.matched?"rgba(0,255,200,.8)":"rgba(255,200,100,.7)",marginTop:3}}>
+                      ☎ {frozenHit.phone}
+                    </div>}
+                    <div style={{display:"flex",alignItems:"center",gap:6,marginTop:5}}>
+                      <span style={{...MN,fontSize:22,color:frozenHit.matched?"#00ff88":"#ffaa00",fontWeight:700,
+                        textShadow:frozenHit.matched?"0 0 10px rgba(0,255,136,.5)":"0 0 10px rgba(255,170,0,.4)"}}>
+                        {frozenHit.conf}%
+                      </span>
+                      <div style={{flex:1,height:3,background:"rgba(255,255,255,.07)",borderRadius:2,overflow:"hidden"}}>
+                        <div style={{width:`${frozenHit.conf}%`,height:"100%",borderRadius:2,
+                          background:frozenHit.matched?"#00ff88":"#ffaa00",
+                          boxShadow:frozenHit.matched?"0 0 6px rgba(0,255,136,.5)":"0 0 6px rgba(255,170,0,.4)"}}/>
+                      </div>
+                    </div>
+                    <div style={{...MN,fontSize:7,color:"rgba(120,185,225,.35)",marginTop:3}}>
+                      {new Date(frozenHit.frozenAt).toLocaleTimeString("en-US",{hour12:false})} · DIST: {frozenHit.dist}
+                    </div>
+                  </div>
+                </div>
+              </div>}
+
+              {/* DB list */}
+              {db.length===0?(<div style={{flex:1,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:6,border:"1px solid rgba(0,150,220,.06)",borderRadius:3,background:"rgba(0,5,14,.4)"}}>
+                <span style={{...MN,fontSize:7.5,color:"rgba(0,150,220,.2)",textAlign:"center",lineHeight:1.7}}>DB EMPTY<br/>SWITCH TO SCAN</span>
+              </div>):(
+                <div style={{flex:1,overflowY:"auto",display:"flex",flexDirection:"column",gap:5,paddingRight:2,minHeight:0}}>
+                  {db.map(p=><DBCard key={p.id} person={p} onDelete={doDelete} onEdit={doEdit} highlight={matchHit?.id===p.id?matchHit:null}/>)}
+                </div>
+              )}
+            </div>
+          )}
+
+          {mode==="scan"&&(
+            <div style={{flex:1,display:"flex",flexDirection:"column",gap:5,overflow:"hidden",minHeight:0}}>
+              <MemCard pose="FRONTAL" card={mem.FRONTAL}/>
+              <MemCard pose="LEFT"    card={mem.LEFT}/>
+              <MemCard pose="RIGHT"   card={mem.RIGHT}/>
+              <div style={{padding:"5px 7px",flexShrink:0,border:`1px solid ${mc>=1?"rgba(0,150,220,.14)":"rgba(0,150,220,.07)"}`,borderRadius:2,background:"rgba(0,4,12,.6)"}}>
+                <div style={{...OR,fontSize:6,color:"rgba(0,150,220,.28)",marginBottom:4,letterSpacing:".15em"}}>POSES</div>
+                {["FRONTAL","LEFT","RIGHT"].map(pp=>(<div key={pp} style={{display:"flex",justifyContent:"space-between",padding:"1.5px 0"}}>
+                  <span style={{fontFamily:"Rajdhani",fontSize:8,color:"rgba(120,185,225,.42)",textTransform:"uppercase"}}>{pp}</span>
+                  <span style={{...MN,fontSize:7.5,color:mem[pp]?"#00ff88":"rgba(255,255,255,.14)",transition:"color .4s"}}>{mem[pp]?"● OK":"○ WAIT"}</span>
+                </div>))}
+                {mc===3&&<div style={{marginTop:5,...MN,fontSize:7,color:"rgba(0,255,136,.5)",textAlign:"center"}} className="pulse">⟳ AUTO-SAVING...</div>}
+              </div>
+            </div>
+          )}
+
+          {mode==="update"&&<UpdatePanel target={updTgt} proposed={updProp}/>}
+        </div>
+      </div>
+
+      {/* ── LOG ── */}
+      <div style={{...PNL,height:68,margin:"0 5px 5px",padding:"4px 10px",flexShrink:0}}>
+        <div style={{position:"absolute",top:0,left:"10%",right:"10%",height:1,background:"linear-gradient(90deg,transparent,rgba(0,150,220,.28),transparent)"}}/>
+        <div style={{...OR,fontSize:6,color:"rgba(0,150,220,.2)",letterSpacing:".2em",marginBottom:2}}>
+          EVENT LOG ────────────────────────────────────────────────────────────────────────────────────
+        </div>
+        <div style={{overflow:"hidden",height:46}}>
+          {logs.slice(0,5).map((lg,i)=><LLine key={lg.id} log={lg} op={Math.max(0,1-i*.22)}/>)}
+        </div>
+      </div>
+    </div>
+  );
+}
+ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
+</script>
+</body>
+</html>
